@@ -905,10 +905,34 @@ index 89edf3d..3495286 100644
          if (!initSwapchain())
          {
 diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_hw_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_hw_backend.cpp
-index 6c2c47c..d22bd6b 100644
+index 6c2c47c..2034e16 100644
 --- a/ps2xRuntime/src/lib/gs/gpu/gs_hw_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gpu/gs_hw_backend.cpp
-@@ -664,7 +664,7 @@ void main()
+@@ -25,6 +25,14 @@ namespace
+ {
+     using namespace GSGL;
+ 
++    // The viewport maps native pixels to the allocated (ceil-rounded) target.
++    // Scissors must use that same ratio, not the requested nominal scale.
++    inline uint32_t scissorEdge(uint32_t coordinate, uint32_t host, uint32_t native, bool upper)
++    {
++        const uint64_t numerator = uint64_t(coordinate) * host;
++        return static_cast<uint32_t>((numerator + (upper ? native - 1u : 0u)) / native);
++    }
++
+     constexpr GLenum kArrayBuffer = 0x8892;
+     constexpr GLenum kFloat = 0x1406;
+     constexpr GLenum kColorAttachment0 = 0x8CE0;
+@@ -532,6 +540,8 @@ struct GSHwBackend::Impl
+     uint32_t vramSize = 0;
+ 
+     float scale = 2.0f;
++    float halfPixelX[64]{};
++    float halfPixelY = 0.25f;
+     GLuint program = 0, vao = 0, vbo = 0, ibo = 0;
+     // GOW-Port: the draw program's uniforms by id (locXxx = uniform uXxx). u1i/u4i/u1f/u2f record values; before each
+     // draw, useDrawProgram picks the program variant for them and sends that program the values it does not have yet.
+@@ -664,7 +674,7 @@ void main()
          g.BindBuffer(kPixelPackBuffer, 0u);
          readbackCopyNanos += static_cast<uint64_t>(
              std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -917,7 +941,7 @@ index 6c2c47c..d22bd6b 100644
          if (++readbackCopies % 256u == 0u && timed)
          {
              std::fprintf(stderr, "[gs-hw] readback map+copy %.2f ms per frame (256 frames)\n", readbackCopyNanos * 1e-6 / 256.0);
-@@ -997,19 +997,21 @@ void main()
+@@ -997,19 +1007,21 @@ void main()
      } cpuTiming;
      void cpuMark(int part)
      {
@@ -940,7 +964,7 @@ index 6c2c47c..d22bd6b 100644
          const auto now = std::chrono::steady_clock::now();
          if (!timed || now - cpuTiming.last < std::chrono::seconds(5))
              return;
-@@ -1034,7 +1036,7 @@ void main()
+@@ -1034,7 +1046,7 @@ void main()
      }
      GLint streamVertices(StreamBuffer &sb, const void *data, size_t bytes, size_t stride, GLenum target = kArrayBuffer)
      {
@@ -949,7 +973,19 @@ index 6c2c47c..d22bd6b 100644
          struct StreamTimer
          {
              CpuTiming &t;
-@@ -1300,8 +1302,32 @@ void main()
+@@ -1176,6 +1188,11 @@ void main()
+         }
+         if (const char *s = std::getenv("PS2X_GS_HW_SCALE"))
+             scale = std::max(1.0f, static_cast<float>(std::atof(s)));
++        for (uint32_t fbw = 0; fbw < 64u; ++fbw) {
++            const float width = static_cast<float>(std::max(fbw, 1u) * 64u);
++            halfPixelX[fbw] = 0.5f * width / std::ceil(width * scale);
++        }
++        halfPixelY = 0.5f * 512.0f / std::ceil(512.0f * scale);
+         std::fprintf(stderr, "[gs-hw] render-target renderer ready, scale %.2f (%s)\n", scale,
+                      reinterpret_cast<const char *>(g.GetString(kRenderer)));
+         initialized = true;
+@@ -1300,8 +1317,32 @@ void main()
          return psm == GS_PSM_T8 || psm == GS_PSM_T8H || psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
      }
  
@@ -982,7 +1018,7 @@ index 6c2c47c..d22bd6b 100644
          const GSTex0Reg &t = s.context.tex0;
          uint64_t key = t.tbp0 | (static_cast<uint64_t>(t.tbw) << 14) | (static_cast<uint64_t>(t.psm & 63) << 20) |
                         (static_cast<uint64_t>(s.textureWidth) << 26) | (static_cast<uint64_t>(s.textureHeight) << 38);
-@@ -1432,6 +1458,7 @@ void main()
+@@ -1432,6 +1473,7 @@ void main()
      // the CLUT, so palette changes (animated CLUTs, the same image with several palettes) cost nothing.
      Texture &indexTextureFor(const GSDrawState &s)
      {
@@ -990,7 +1026,7 @@ index 6c2c47c..d22bd6b 100644
          const GSTex0Reg &t = s.context.tex0;
          const uint64_t key = (1ull << 63) | t.tbp0 | (static_cast<uint64_t>(t.tbw) << 14) | (static_cast<uint64_t>(t.psm & 63) << 20) |
                               (static_cast<uint64_t>(s.textureWidth) << 26) | (static_cast<uint64_t>(s.textureHeight) << 38);
-@@ -1526,11 +1553,20 @@ void main()
+@@ -1526,11 +1568,20 @@ void main()
          if (it != palettes.end())
              return it->second;
          const Api &g = gl();
@@ -1012,7 +1048,24 @@ index 6c2c47c..d22bd6b 100644
          }
          uint32_t colors[256];
          store.BuildPalette(s, colors);
-@@ -2269,11 +2305,22 @@ void main()
+@@ -1866,10 +1917,13 @@ void main()
+         // pixel scale * x equal the PS2's at x. (Half a PS2 pixel moved every primitive one host pixel down and right at
+         // 2x: host row/column 0 of every target stayed unpainted and each copy pass shifted the picture by a host pixel;
+         // the filtered passes smeared that stale edge into the picture, the bright bar along the top and left.)
+-        const float half = 0.5f / scale;
++        // ceil-rounded allocations have slightly different X/Y scale factors.
++        // Use their actual half-pixel offsets so column/row zero remain covered.
++        const float halfX = halfPixelX[c.frame.fbw & 63u];
++        const float halfY = halfPixelY;
+         HwVertex h;
+-        h.x = v.x - static_cast<float>(c.xyoffset.ofx) / 16.0f + half;
+-        h.y = v.y - static_cast<float>(c.xyoffset.ofy) / 16.0f + half;
++        h.x = v.x - static_cast<float>(c.xyoffset.ofx) / 16.0f + halfX;
++        h.y = v.y - static_cast<float>(c.xyoffset.ofy) / 16.0f + halfY;
+         // the Z buffer keeps only its low bits (Z24: 24, Z16: 16): a vertex Z of 1<<24 is stored as 0
+         double zq = std::max(v.z, 0.0);
+         if (zmax < 4294967295.0f)
+@@ -2269,11 +2323,22 @@ void main()
              const float us[2] = {u0, u1}, vs[2] = {v0, v1};
              // the texel coordinates of the first and last pixel the GS covers (pixel n is covered when lo <= n < hi);
              // a sprite covering no pixel on the GS keeps its whole range
@@ -1037,7 +1090,7 @@ index 6c2c47c..d22bd6b 100644
                  if (last < first || p1 == p0)
                      return;
                  const float ta = t0 + (first - p0) * (t1 - t0) / (p1 - p0), tb = t0 + (last - p0) * (t1 - t0) / (p1 - p0);
-@@ -2478,7 +2525,7 @@ void main()
+@@ -2478,7 +2543,7 @@ void main()
              pendingIdx.clear();
              return;
          }
@@ -1046,7 +1099,7 @@ index 6c2c47c..d22bd6b 100644
          cpuTiming.vertices += pending.size();
          ++cpuTiming.draws;
          draw(pendingState, pending, pendingIdx);
-@@ -2855,7 +2902,7 @@ void main()
+@@ -2855,7 +2920,7 @@ void main()
          const GLsizei batchCount = static_cast<GLsizei>(indexed ? idx.size() : verts.size());
          const Api &g = gl();
          ++frameBatch;
@@ -1055,17 +1108,75 @@ index 6c2c47c..d22bd6b 100644
          struct PostMark
          {
              Impl &d;
-@@ -2933,7 +2980,8 @@ void main()
+@@ -2881,7 +2946,8 @@ void main()
+             return;
+         static const double dumpAtSec = std::getenv("GOW_GS_HW_DUMPAT") ? std::atof(std::getenv("GOW_GS_HW_DUMPAT")) : -1.0;
+         static const auto t0 = std::chrono::steady_clock::now();
+-        const double nowSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++        const double nowSec = dumpAtSec >= 0.0 && dumpedAt == 0
++            ? std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() : 0.0;
+         if (dumpAtSec >= 0.0 && nowSec >= dumpAtSec && dumpedAt == 0 && frameBatch == 1)
+             dumpedAt = 1;
+         if (dumpedAt == 1 && dumped < dumpMax && dumpPresents < 0)
+@@ -2932,8 +2998,11 @@ void main()
+         g.Enable(kScissorTest);
          const int sx0 = c.scissor.x0, sy0 = c.scissor.y0;
          const int sw = std::max(0, static_cast<int>(c.scissor.x1) - sx0 + 1), sh = std::max(0, static_cast<int>(c.scissor.y1) - sy0 + 1);
-         g.Scissor(static_cast<GLint>(std::floor(sx0 * scale)), static_cast<GLint>(std::floor(sy0 * scale)),
+-        g.Scissor(static_cast<GLint>(std::floor(sx0 * scale)), static_cast<GLint>(std::floor(sy0 * scale)),
 -                  static_cast<GLsizei>(std::ceil(sw * scale)), static_cast<GLsizei>(std::ceil(sh * scale)));
-+                  sw ? static_cast<GLsizei>(std::ceil((sx0 + sw) * scale) - std::floor(sx0 * scale)) : 0,
-+                  sh ? static_cast<GLsizei>(std::ceil((sy0 + sh) * scale) - std::floor(sy0 * scale)) : 0);
++        const uint32_t hx0 = scissorEdge(sx0, rt.glW, rt.pxW, false);
++        const uint32_t hy0 = scissorEdge(sy0, rt.glH, rt.pxH, false);
++        const uint32_t hx1 = scissorEdge(sx0 + sw, rt.glW, rt.pxW, true);
++        const uint32_t hy1 = scissorEdge(sy0 + sh, rt.glH, rt.pxH, true);
++        g.Scissor(hx0, hy0, sw ? hx1 - hx0 : 0u, sh ? hy1 - hy0 : 0u);
          g.Disable(kCullFace);
  
          // depth
-@@ -3191,7 +3239,7 @@ void main()
+@@ -2956,7 +3025,42 @@ void main()
+             for (HwVertex &v : flippedZ)
+                 v.z = 1.0f - v.z;
+         }
+-        const std::vector<HwVertex> &dverts = zInv ? flippedZ : verts;
++        const std::vector<HwVertex> &depthVerts = zInv ? flippedZ : verts;
++        thread_local std::vector<HwVertex> overlayVerts;
++        bool snapOverlay = false;
++        static const bool snapPostprocess = [] {
++            const char *v = std::getenv("GOW_POSTPROCESS_SNAP");
++            return v && v[0] == '1';
++        }();
++        // A flat fullscreen modulation pass is tiled with GS 1/16-pixel
++        // endpoints. Gaps smaller than a native pixel are invisible at 1x,
++        // but fractional upscales can sample them as a stationary column.
++        // Keep this opt-in until the renderer capture comparison passes.
++        if (snapPostprocess && scale > 1.0f && s.prim.tme && s.prim.iip && c.zbuf.zmask &&
++            c.frame.fbmsk == 0xff000000u && (c.alpha & 0xffu) == 0x54u && !depthVerts.empty()) {
++            const float halfX = halfPixelX[c.frame.fbw & 63u], halfY = halfPixelY;
++            float x0=1e9f, y0=1e9f, x1=-1e9f, y1=-1e9f;
++            bool flatGrid = true;
++            for (const HwVertex &v : depthVerts) {
++                const float x=v.x-halfX, y=v.y-halfY;
++                x0=std::min(x0,x); y0=std::min(y0,y); x1=std::max(x1,x); y1=std::max(y1,y);
++                flatGrid = flatGrid && std::fabs(v.z-depthVerts[0].z)<1e-7f &&
++                    std::fabs(x-std::round(x))<=0.0635f && std::fabs(y-std::round(y))<=0.0635f;
++            }
++            snapOverlay = flatGrid && x0<=c.scissor.x0+0.0635f && y0<=c.scissor.y0+0.0635f &&
++                x1>=c.scissor.x1-0.0635f && y1>=c.scissor.y1-0.0635f;
++            if (snapOverlay) {
++                overlayVerts = depthVerts;
++                for (HwVertex &v : overlayVerts) {
++                    v.x=std::ceil(v.x-halfX-0.0001f)+halfX;
++                    v.y=std::ceil(v.y-halfY-0.0001f)+halfY;
++                }
++                static unsigned reports=0;
++                if (reports++<3u) std::fprintf(stderr,"[gs-overlay-snap] verts=%zu tbp=%x rect=%.4f,%.4f-%.4f,%.4f\n",
++                    overlayVerts.size(),c.tex0.tbp0,x0,y0,x1,y1);
++            }
++        }
++        const std::vector<HwVertex> &dverts = snapOverlay ? overlayVerts : depthVerts;
+         if (isZInversion(s, verts))
+         {
+             if (zInverted(c.zbuf.zbp))
+@@ -3191,7 +3295,7 @@ void main()
              else
                  g.DrawArrays(kTriangles, first, batchCount);
          };
@@ -1074,7 +1185,7 @@ index 6c2c47c..d22bd6b 100644
  
          const bool ate = (c.test & 1u) != 0u;
          const uint32_t atst = static_cast<uint32_t>((c.test >> 1) & 7u), aref = static_cast<uint32_t>((c.test >> 4) & 0xFFu);
-@@ -3535,7 +3583,7 @@ void GSHwBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+@@ -3535,7 +3639,7 @@ void GSHwBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
      static const bool keepBatch = [] { const char *v = std::getenv("GOW_GS_HW_CLUT_KEEP"); return !v || v[0] != '0'; }();
      if (keepBatch && d.initialized && d.havePending && !d.haveShuffle && !d.clutSourceMayBeTarget(tex0))
      {
@@ -1083,7 +1194,7 @@ index 6c2c47c..d22bd6b 100644
          const std::array<uint16_t, 512> before = d.store.Clut();
          d.store.LoadClut(tex0, texclut);
          if (d.store.Clut() == before)
-@@ -3557,7 +3605,7 @@ void GSHwBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+@@ -3557,7 +3661,7 @@ void GSHwBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
      }
      d.flushPending();
      // the CLUT load itself (the draws flushed above are draw_ms)
@@ -1092,18 +1203,22 @@ index 6c2c47c..d22bd6b 100644
      struct ClutTimer
      {
          Impl &d;
-@@ -3654,8 +3702,8 @@ bool GSHwBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -3653,9 +3757,11 @@ bool GSHwBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+     g.BindFramebuffer(kFramebuffer, rt.fbo);
      g.Enable(kScissorTest);
      const int sx0 = context.scissor.x0, sy0 = context.scissor.y0;
-     g.Scissor(static_cast<GLint>(std::floor(sx0 * d.scale)), static_cast<GLint>(std::floor(sy0 * d.scale)),
+-    g.Scissor(static_cast<GLint>(std::floor(sx0 * d.scale)), static_cast<GLint>(std::floor(sy0 * d.scale)),
 -              static_cast<GLsizei>(std::ceil((context.scissor.x1 - sx0 + 1) * d.scale)),
 -              static_cast<GLsizei>(std::ceil((context.scissor.y1 - sy0 + 1) * d.scale)));
-+              static_cast<GLsizei>(std::ceil((context.scissor.x1 + 1) * d.scale) - std::floor(sx0 * d.scale)),
-+              static_cast<GLsizei>(std::ceil((context.scissor.y1 + 1) * d.scale) - std::floor(sy0 * d.scale)));
++    const uint32_t hx0 = scissorEdge(sx0, rt.glW, rt.pxW, false);
++    const uint32_t hy0 = scissorEdge(sy0, rt.glH, rt.pxH, false);
++    const uint32_t hx1 = scissorEdge(context.scissor.x1 + 1u, rt.glW, rt.pxW, true);
++    const uint32_t hy1 = scissorEdge(context.scissor.y1 + 1u, rt.glH, rt.pxH, true);
++    g.Scissor(hx0, hy0, hx1 > hx0 ? hx1 - hx0 : 0u, hy1 > hy0 ? hy1 - hy0 : 0u);
      g.ColorMask(kTrue, kTrue, kTrue, kTrue);
      g.ClearColor((rgba & 0xFF) / 255.0f, ((rgba >> 8) & 0xFF) / 255.0f, ((rgba >> 16) & 0xFF) / 255.0f, ((rgba >> 24) & 0xFF) / 255.0f);
      g.Clear(kColorBufferBit);
-@@ -3695,7 +3743,7 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
+@@ -3695,7 +3801,7 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
      PresentationFrame frame;
      if (!d.ensure())
          return frame;

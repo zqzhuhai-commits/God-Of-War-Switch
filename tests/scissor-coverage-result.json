@@ -1,0 +1,12 @@
+{
+  "cases": 126000,
+  "nominal_scale_clipped_sample_cases": 20407,
+  "viewport_ratio_clipped_sample_cases": 0,
+  "integer_scale_offsets_unchanged": true,
+  "concrete_edge": {
+    "native": 280,
+    "old_upper": 450,
+    "new_upper": 451
+  },
+  "status": "PASS"
+}

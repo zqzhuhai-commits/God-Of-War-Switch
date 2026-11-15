@@ -1,0 +1,10 @@
+{
+  "native_sample_coverage_checks": 6207,
+  "specific_hole": {
+    "left_end_host": 359.9620361328125,
+    "sample_column": 360,
+    "right_start_host": 360.0625
+  },
+  "snapped_shared_edge_host": 360.0625,
+  "status": "PASS"
+}

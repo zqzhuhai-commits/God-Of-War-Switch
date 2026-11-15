@@ -1,0 +1,17 @@
+{
+  "pc_only": true,
+  "old_batch25_columns_359_360_361": [
+    28.84,
+    71.02,
+    28.83
+  ],
+  "new_batch25_columns_359_360_361": [
+    90.82,
+    90.88,
+    90.92
+  ],
+  "same_scene_different_camera_frames": true,
+  "interpretation": "Per-pass adjacent-column continuity plus visual captures; not a pixel-identical A/B or Switch hardware validation",
+  "switch_build": "PASS",
+  "hardware_test": "Pending"
+}
