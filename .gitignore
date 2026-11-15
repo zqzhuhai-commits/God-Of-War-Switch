@@ -1,0 +1,11 @@
+upstream/
+build*/
+private/
+*.iso
+*.ISO
+*.PAK
+*.nro
+*.nsp
+*.keys
+*.mcd
+__pycache__/

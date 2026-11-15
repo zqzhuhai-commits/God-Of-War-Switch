@@ -1,0 +1,1944 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7813159..e0856ab 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -62,6 +62,9 @@ if(PS2X_IS_ARM_TARGET)
+     elseif(PS2X_IS_AARCH64_TARGET AND MSVC)
+         # Windows ARM64 - MSVC already uses optimal defaults
+         message(STATUS "Windows ARM64 (MSVC) - using default compiler flags")
++    elseif(PS2X_IS_AARCH64_TARGET AND NINTENDO_SWITCH)
++        # GOW-Port: Tegra X1 baseline; compiler flag acceptance is not a CPU feature probe.
++        add_compile_options(-march=armv8-a+simd -ffp-contract=off -fno-strict-aliasing -fwrapv)
+     elseif(PS2X_IS_AARCH64_TARGET)
+         # Linux ARM64 - add NEON flags
+         message(STATUS "Non-Apple ARM64 - adding NEON compiler flags")
+@@ -79,6 +82,11 @@ if(PS2X_IS_ARM_TARGET)
+     endif()
+ endif()
+ 
++# GOW-Port: desktop Clang/GCC require explicit SSE4.1 for runtime intrinsics.
++if(NOT MSVC AND NOT PS2X_IS_ARM_TARGET AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64")
++    add_compile_options(-msse4.1 -ffp-contract=off -fno-strict-aliasing -fwrapv)
++endif()
++
+ if(PS2X_BUILD_RECOMP)
+     add_subdirectory("ps2xRecomp")
+ endif()
+diff --git a/ps2xIOP/src/disc_source.cpp b/ps2xIOP/src/disc_source.cpp
+index 7513260..779cfbd 100644
+--- a/ps2xIOP/src/disc_source.cpp
++++ b/ps2xIOP/src/disc_source.cpp
+@@ -6,6 +6,7 @@
+ #include <array>
+ #include <cctype>
+ #include <cstring>
++#include <cstdio>
+ #include <fstream>
+ #include <map>
+ #include <mutex>
+@@ -182,6 +183,10 @@ namespace ps2x::iop
+                 std::string line;
+                 while (std::getline(layout, line))
+                 {
++                    // Windows text streams translate CRLF; libnx text streams
++                    // keep CR. Never include the line terminator in a disc path.
++                    if (!line.empty() && line.back() == '\r')
++                        line.pop_back();
+                     std::istringstream fields(line);
+                     std::string kind;
+                     fields >> kind;
+@@ -249,7 +254,12 @@ namespace ps2x::iop
+                     stream.clear();
+                     stream.seekg(static_cast<std::streamoff>(offset));
+                     stream.read(reinterpret_cast<char *>(out), static_cast<std::streamsize>(wanted));
+-                    ok = ok && static_cast<size_t>(stream.gcount()) == wanted;
++                    const bool complete = static_cast<size_t>(stream.gcount()) == wanted;
++                    if (!complete && m_readErrors++ < 8u)
++                        std::fprintf(stderr, "[disc-read-error] file=%s lsn=%u offset=%llu wanted=%zu got=%lld state=%u\n",
++                                     file->path.c_str(), sector, static_cast<unsigned long long>(offset), wanted,
++                                     static_cast<long long>(stream.gcount()), static_cast<unsigned>(stream.rdstate()));
++                    ok = ok && complete;
+                     i += run;
+                 }
+                 return ok;
+@@ -293,7 +303,14 @@ namespace ps2x::iop
+             {
+                 auto it = m_handles.find(entry.lsn);
+                 if (it == m_handles.end())
++                {
+                     it = m_handles.emplace(entry.lsn, std::ifstream(m_root / std::filesystem::path(entry.path), std::ios::binary)).first;
++                    std::error_code ec;
++                    const auto actual = std::filesystem::file_size(m_root / std::filesystem::path(entry.path), ec);
++                    std::fprintf(stderr, "[disc-file] %s expected=%u actual=%llu stat_error=%d open=%d\n",
++                                 entry.path.c_str(), entry.size, static_cast<unsigned long long>(actual), ec.value(),
++                                 it->second.is_open() ? 1 : 0);
++                }
+                 return it->second;
+             }
+ 
+@@ -304,6 +321,7 @@ namespace ps2x::iop
+             std::vector<Entry> m_files;
+             std::unordered_map<uint32_t, std::array<uint8_t, kSector>> m_meta;
+             std::map<uint32_t, std::ifstream> m_handles;
++            uint32_t m_readErrors = 0;
+         };
+     }
+ 
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index e1e20a9..ed6ac5d 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -216,9 +216,9 @@ namespace ps2x::iop::detail
+         const uint32_t phys = physicalAddress(address);
+         if (phys > RamSize || size > RamSize - phys)
+             return false;
+-        return std::all_of(m_owned.begin() + phys, m_owned.begin() + phys + size,
+-                           [](uint8_t value)
+-                           { return value != 0u; });
++        // The ownership bitmap is byte-addressed. A zero byte is precisely
++        // the failure condition; use libc's bulk search for large CD/RPC buffers.
++        return size == 0u || std::memchr(m_owned.data() + phys, 0, size) == nullptr;
+     }
+ 
+     void IopMemory::markOwned(uint32_t address, size_t size)
+diff --git a/ps2xIOP/src/emulator/core/sound_engine.cpp b/ps2xIOP/src/emulator/core/sound_engine.cpp
+index af9d85c..d9817bf 100644
+--- a/ps2xIOP/src/emulator/core/sound_engine.cpp
++++ b/ps2xIOP/src/emulator/core/sound_engine.cpp
+@@ -822,12 +822,18 @@ namespace ps2x::iop::detail
+         std::lock_guard<std::mutex> lock(m_outputMutex);
+         size_t available = m_output.size() / 2u;
+         size_t dropped = 0;
++        std::array<int16_t, 256> skippedTail{};
++        size_t transitionFrames = 0;
+         double rate = 1.0;
+         if (maxLatencyFrames != SIZE_MAX)
+         {
+             if (available > maxFrames + 4u * maxLatencyFrames)
+             {
+                 dropped = available - maxFrames - maxLatencyFrames;
++                // Preserve a short continuation of the old read position for
++                // a crossfade into the retained audio, instead of a hard splice.
++                transitionFrames = std::min<size_t>({128u, maxFrames, dropped});
++                std::copy_n(m_output.begin(), transitionFrames * 2u, skippedTail.begin());
+                 m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(dropped * 2u));
+                 available -= dropped;
+                 m_resamplePhase = 0.0;
+@@ -860,11 +866,21 @@ namespace ps2x::iop::detail
+             }
+         }
+         const size_t consumed = std::min(available, static_cast<size_t>(position));
++        transitionFrames = std::min(transitionFrames, frames);
++        for (size_t i = 0; i < transitionFrames; ++i)
++            for (size_t side = 0; side < 2u; ++side)
++            {
++                const int32_t weight = static_cast<int32_t>(i + 1u);
++                const int32_t length = static_cast<int32_t>(transitionFrames);
++                stereo[i * 2u + side] = static_cast<int16_t>(
++                    (static_cast<int32_t>(skippedTail[i * 2u + side]) * (length - weight) +
++                     static_cast<int32_t>(stereo[i * 2u + side]) * weight) / length);
++            }
+         m_resamplePhase = position - static_cast<double>(consumed);
+         m_output.erase(m_output.begin(), m_output.begin() + static_cast<std::ptrdiff_t>(consumed * 2u));
+         // GOW_AUDIO_STATS=1: every ~5 s, frames requested by the device, frames missing (underrun -> silence), frames
+         // dropped after a stall, the highest playback rate and the buffered level
+-        static const bool stats = std::getenv("GOW_AUDIO_STATS") != nullptr;
++        static const bool stats = [] { const char *v = std::getenv("GOW_AUDIO_STATS"); return v && v[0] && v[0] != '0'; }();
+         if (stats)
+         {
+             static size_t requested = 0, missing = 0, droppedSum = 0, calls = 0, minLevel = SIZE_MAX, maxLevel = 0;
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index b55641f..9f1cc87 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -236,7 +236,8 @@ namespace ps2x::iop::detail
+                 const bool ok = readSectors(a0, a1, a2);
+                 // GOW_CD_TRACE=1 (debug): every sceCdRead (lsn, sectors, IOP destination, result)
+                 static const bool trace = std::getenv("GOW_CD_TRACE") != nullptr;
+-                if (trace)
++                static uint32_t traceCount = 0;
++                if (trace && (++traceCount <= 32u || traceCount % 10000u == 0u))
+                     std::fprintf(stderr, "[cd-read] lsn=%u sectors=%u dst=%x ok=%d\n", a0, a1, a2, ok ? 1 : 0);
+                 if (ok)
+                 {
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index b1dcad0..d1e0949 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -152,6 +152,7 @@ namespace ps2x::iop::detail
+             modules.clear();
+             nativeRanges.clear();
+             nativeOverrides.clear();
++            std::fill(nativeOverrideSlots.begin(),nativeOverrideSlots.end(),nullptr);
+             imports.reset();
+             importCache.clear();
+             rpc.reset();
+@@ -516,11 +517,13 @@ namespace ps2x::iop::detail
+             }
+ 
+             // GOW-Port: IRX functions replaced by native C++ run instead of the function (then return to $ra).
+-            if (!nativeOverrides.empty())
+-                if (const auto found = nativeOverrides.find(physicalAddress(cpu.pc)); found != nativeOverrides.end())
++            const uint32_t overridePc=physicalAddress(cpu.pc);
++            const IopNativeOverride *nativeOverride = (overridePc < IopMemory::RamSize && (overridePc & 3u)==0u)
++                ? nativeOverrideSlots[overridePc >> 2u] : nullptr;
++            if (nativeOverride)
+                 {
+                     IopNativeCall call{cpu, memory, host, *this};
+-                    found->second->handler(call);
++                    nativeOverride->handler(call);
+                     cpu.gpr[0] = 0u;
+                     cpu.pc = cpu.gpr[31];
+                     cpu.branchPending = false;
+@@ -1041,7 +1044,12 @@ namespace ps2x::iop::detail
+                 const IopNativeOverride *overrides = iopNativeOverrides(overrideCount);
+                 for (size_t i = 0; i < overrideCount; ++i)
+                     if (ident == overrides[i].module && overrides[i].offset < module.textSize)
+-                        nativeOverrides[lo + overrides[i].offset] = &overrides[i];
++                    {
++                        const uint32_t address=lo+overrides[i].offset;
++                        nativeOverrides[address] = &overrides[i];
++                        if(address < IopMemory::RamSize && (address&3u)==0u)
++                            nativeOverrideSlots[address>>2u]=&overrides[i];
++                    }
+             }
+             size_t count = 0;
+             const IopNativeModule *table = iopNativeModules(count);
+@@ -1090,6 +1098,9 @@ namespace ps2x::iop::detail
+             importCache.clear();
+             const uint32_t lo = physicalAddress(it->second.base);
+             std::erase_if(nativeRanges, [&](const NativeRange &r) { return r.lo == lo; });
++            for(const auto &item : nativeOverrides)
++                if(item.first >= lo && item.first < lo+it->second.size && item.first < IopMemory::RamSize && (item.first&3u)==0u)
++                    nativeOverrideSlots[item.first>>2u]=nullptr;
+             std::erase_if(nativeOverrides, [&](const auto &kv) { return kv.first >= lo && kv.first < lo + it->second.size; });
+             rpc.removeServersInRange(it->second.base, it->second.size);
+             imports.eraseRange(it->second.base, it->second.size);
+@@ -1118,6 +1129,7 @@ namespace ps2x::iop::detail
+         IopLoadcore loadcore;
+         std::map<int, Module> modules;
+         std::vector<NativeRange> nativeRanges;
++        std::vector<const IopNativeOverride *> nativeOverrideSlots = std::vector<const IopNativeOverride *>(IopMemory::RamSize / 4u, nullptr);
+         std::unordered_map<uint32_t, const IopNativeOverride *> nativeOverrides; // physical address -> handler
+ 
+         // IopNativeServices (for the native IRX overrides)
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+index 4d3c465..a40bd88 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -323,8 +323,17 @@ namespace ps2x::iop::detail
+     bool IopModuleLoader::readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes)
+     {
+         Elf32Ehdr header{};
+-        if (!host.readGuest(guestAddress, &header, sizeof(header)) || !validElfHeader(header))
+-            return false;
++        // GOW-Port: LoadStartModuleBuffer receives IOP RAM after SIF DMA;
++        // ExecModuleBuffer may receive an EE buffer. Validate the ELF header before choosing.
++        bool fromIop = false;
++        if (!host.readGuest(guestAddress, &header, sizeof(header)) || !validElfHeader(header)) {
++            if (!host.readIopMemory(guestAddress, &header, sizeof(header)) || !validElfHeader(header))
++                return false;
++            fromIop = true;
++        }
++        const auto readImage = [&](uint32_t address, void *dst, size_t size) {
++            return fromIop ? host.readIopMemory(address, dst, size) : host.readGuest(address, dst, size);
++        };
+ 
+         uint64_t required = sizeof(header);
+         required = std::max<uint64_t>(required, static_cast<uint64_t>(header.phoff) + static_cast<uint64_t>(header.phentsize) * header.phnum);
+@@ -334,7 +343,7 @@ namespace ps2x::iop::detail
+             return false; // Should we log an error here? TODO check later
+ 
+         bytes.resize(static_cast<size_t>(required));
+-        if (!host.readGuest(guestAddress, bytes.data(), bytes.size()))
++        if (!readImage(guestAddress, bytes.data(), bytes.size()))
+             return false;
+ 
+         if (header.shnum != 0u && header.shentsize >= sizeof(Elf32Shdr))
+@@ -364,7 +373,7 @@ namespace ps2x::iop::detail
+             return false;
+ 
+         bytes.resize(static_cast<size_t>(required));
+-        return host.readGuest(guestAddress, bytes.data(), bytes.size());
++        return readImage(guestAddress, bytes.data(), bytes.size());
+     }
+ 
+     IopImageLoadResult IopModuleLoader::load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor)
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index a2e5636..24a5814 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -10,6 +10,7 @@
+ #include <sstream>
+ #include <array>
+ #include <cstring>
++#include <cstdio>
+ #include <limits>
+ #include <vector>
+ 
+@@ -326,6 +327,12 @@ namespace ps2x::iop::detail
+             return result;
+ 
+         RpcServer &server = serverIt->second;
++        static const bool bootTrace = std::getenv("GOW_RPC_BOOT_TRACE") != nullptr;
++        static uint32_t callNumber = 0;
++        const uint32_t call = bootTrace ? ++callNumber : 0u;
++        if (bootTrace && call <= 128u)
++            std::fprintf(stderr, "[rpc-boot] begin #%u sid=%x fn=%u entry=%x send=%u recv=%u\n",
++                         call, request.sid, request.function, server.function, request.send.size, request.receive.size);
+         if (request.send.size != 0u && server.buffer != 0u)
+         {
+             const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));
+@@ -347,6 +354,8 @@ namespace ps2x::iop::detail
+         // ese hilo se ejecuta antes de que el hilo RPC conteste. Sin esto, smpd tomaba el destino de la lectura
+         // de la peticion siguiente y los datos acababan en el bufer equivocado.
+         executor.runReadyThreads(kRpcSettleCycles);
++        if (bootTrace && call <= 128u)
++            std::fprintf(stderr, "[rpc-boot] end #%u return=%x\n", call, returnPointer);
+         if (returnPointer == 0u)
+             returnPointer = server.buffer;
+         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 3b42cb1..c63a9b6 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -553,6 +553,12 @@ else()
+     )
+ endif()
+ 
++# GOW-Port: keep SCAJ registration in the executable so static initialization is retained.
++set_source_files_properties(src/port/scaj_overrides.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++set_source_files_properties(src/port/scaj_pad2.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++set_source_files_properties(src/port/scaj_timers.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++target_sources(ps2EntryRunner PRIVATE src/port/scaj_overrides.cpp src/port/scaj_pad2.cpp src/port/scaj_timers.cpp)
++
+ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+     set_target_properties(ps2EntryRunner PROPERTIES
+         UNITY_BUILD ON
+@@ -629,8 +635,8 @@ if(PS2X_VU1_PREGENERATED_DIR)
+     target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1_PREGENERATED_PARTS})
+     set_source_files_properties(${PS2X_VU1_PREGENERATED_PARTS} PROPERTIES
+         SKIP_UNITY_BUILD_INCLUSION ON
+-        SKIP_PRECOMPILE_HEADERS ON)
+-    target_include_directories(ps2EntryRunner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
++        SKIP_PRECOMPILE_HEADERS ON
++        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
+     list(LENGTH PS2X_VU1_PREGENERATED_PARTS PS2X_VU1_PREGENERATED_COUNT)
+     message(STATUS "VU1 compilada (pregenerated): ${PS2X_VU1_PREGENERATED_COUNT} files from ${PS2X_VU1_PREGENERATED_DIR}")
+ elseif(PS2X_VU1_MICROCODE_DIR AND PS2X_VU1_GENERATOR_SOURCE AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
+@@ -842,3 +848,9 @@ install(DIRECTORY include/
+ 
+ # GOW-Port include
+ target_include_directories(ps2EntryRunner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/runner)
++
++# GOW-Port: opt-in layout for God of War; the normal game heap extends into high RAM.
++option(PS2X_GOW_LOW_RESERVED_MEMORY "Keep runtime pools and callback stacks below the game ELF" OFF)
++if(PS2X_GOW_LOW_RESERVED_MEMORY)
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_GOW_LOW_RESERVED_MEMORY=1)
++endif()
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 9d94d8a..367a42f 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -289,6 +289,9 @@ public:
+     // host clock (a scheduled event's host deadline has passed but its guest cycle is not reached), account the
+     // missing cycles (at most maxCycles) so guest time, EE timers and the IOP keep real time. Returns cycles added.
+     uint64_t catchUpToHost(uint64_t maxCycles) noexcept;
++    // Extrapolate the VBlank clock pair to now, even between scheduled events.
++    // Called on the EE executor before the game's frame-clock read.
++    uint64_t catchUpFrameClock(uint64_t maxCycles) noexcept;
+     // GOW-Port: for guest countdown loops run natively (gow_overrides vid wait loops): takes up to maxCount
+     // checkpoints of `cycles` each at once, as many as EeCheckpointClock::advanceQuiet would let through one by one
+     // (all below quietCycles, no flag set). Same clock, timer and IOP state as that many fast-path checkpoints.
+@@ -469,6 +472,10 @@ private:
+     uint32_t m_gsVSyncCallbackSp = 0;
+     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
+     std::atomic<uint64_t> m_nextDeadlineCycle{0};
++    // GOW-Port: COP0 Count is a shared hardware clock, not a frozen per-thread field.
++    uint32_t m_cop0Count = 0u;
++    uint64_t m_cop0CountCycle = 0u;
++    void syncCop0Count() noexcept;
+     bool checkpointDueFull(uint32_t cycles) noexcept;
+     uint64_t quietCycles() const noexcept;
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 1b73be2..69926fc 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -118,6 +118,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_insideInterrupt = false;
+     m_pendingEeTimerInterrupts = 0u;
+     m_clock.eeCycle = 0u;
++    m_cop0Count = mainContext.cop0_count;
++    m_cop0CountCycle = 0u;
+     m_sliceEndCycle = kDefaultTimeSliceCycles;
+     m_clock.quietCycles = 0u;
+     m_clock.deferredCycles = 0u;
+@@ -310,23 +312,27 @@ void EeScheduler::run()
+         try
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
++            syncCop0Count();
+             m_guestExecuting.store(true, std::memory_order_release);
+             ps2_perf::guestEntry(context.pc, m_rdram);
+             loadSharedVu0Random(context);
+             g_gowCurFn.store(context.pc, std::memory_order_relaxed);
+             function(m_rdram, &context, &m_runtime);
+             saveSharedVu0Random(context);
++            syncCop0Count();
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+         catch (const EeDispatcherTransfer &)
+         {
+             saveSharedVu0Random(context);
++            syncCop0Count();
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+         catch (...)
+         {
++            syncCop0Count();
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_running.store(false, std::memory_order_release);
+             publishSnapshot();
+@@ -398,6 +404,7 @@ uint64_t EeScheduler::quietCycles() const noexcept
+ 
+ void EeScheduler::syncDeferredCycles(bool limitsChanged) noexcept
+ {
++    syncCop0Count();
+     if (m_clock.deferredCycles != 0u)
+     {
+         const uint64_t deferred = m_clock.deferredCycles;
+@@ -445,10 +452,23 @@ bool EeScheduler::checkpointDueFull(uint32_t cycles) noexcept
+     return false;
+ }
+ 
++// GOW-Port: publish Count at safe points. Generated MFC0 reads the active context;
++// preserve guest MTC0 writes and use one count across thread/interrupt contexts.
++void EeScheduler::syncCop0Count() noexcept
++{
++    R5900Context *context = currentContext();
++    if (context && m_guestExecuting.load(std::memory_order_relaxed))
++        m_cop0Count = context->cop0_count;
++    m_cop0Count += static_cast<uint32_t>(m_clock.eeCycle - m_cop0CountCycle);
++    m_cop0CountCycle = m_clock.eeCycle;
++    if (context) context->cop0_count = m_cop0Count;
++}
++
+ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_clock.eeCycle += elapsed;
++    syncCop0Count();
+     // cycles deferred by EeCheckpointClock::advanceQuiet are already in m_clock.eeCycle
+     const uint64_t accrued = elapsed + m_clock.deferredCycles;
+     m_clock.deferredCycles = 0u;
+@@ -487,6 +507,45 @@ uint64_t EeScheduler::catchUpToHost(uint64_t maxCycles) noexcept
+     return added;
+ }
+ 
++uint64_t EeScheduler::catchUpFrameClock(uint64_t maxCycles) noexcept
++{
++    if (maxCycles == 0u)
++        return 0u;
++    uint64_t target = 0u;
++    {
++        std::lock_guard lock(m_eventMutex);
++        const auto now = std::chrono::steady_clock::now();
++        for (const ScheduledEvent &item : m_deadlines)
++        {
++            if (item.event.type != EeEventType::VBlankStart)
++                continue;
++            // A VBlank's cycle/deadline pair is the existing pacing anchor.
++            // Bound conversion before multiplication after a suspend/load.
++            const int64_t ns = std::clamp<int64_t>(
++                std::chrono::duration_cast<std::chrono::nanoseconds>(now - item.hostDeadline).count(),
++                -1000000000LL, 1000000000LL);
++            const int64_t cycles = ns * static_cast<int64_t>(kEeClockHz) / 1000000000LL;
++            if (cycles >= 0)
++                target = item.deadlineCycle + static_cast<uint64_t>(cycles);
++            else if (item.deadlineCycle > static_cast<uint64_t>(-cycles))
++                target = item.deadlineCycle - static_cast<uint64_t>(-cycles);
++            break;
++        }
++    }
++    if (target <= m_clock.eeCycle)
++        return 0u;
++    uint64_t missing = std::min(target - m_clock.eeCycle, maxCycles);
++    const uint64_t added = missing;
++    while (missing)
++    {
++        const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(missing, 0x40000000u));
++        accountCycles(step); // includes EE timers and the IOP/audio grant
++        missing -= step;
++    }
++    m_clock.checkpointPending.store(true, std::memory_order_release);
++    return added;
++}
++
+ uint64_t EeScheduler::advanceQuietRepeated(uint32_t cycles, uint64_t maxCount) noexcept
+ {
+     const uint64_t each = cycles != 0u ? cycles : 1u;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index bac917d..a46290b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1274,9 +1274,20 @@ namespace ps2_stubs
+             }
+         }
+ 
+-        std::vector<MpegRegisteredCallback> matchingStreamCallbacks(uint32_t mpegAddr, uint32_t streamType)
++        std::vector<MpegRegisteredCallback> matchingStreamCallbacks(uint32_t mpegAddr, uint32_t streamType, uint32_t channel)
+         {
+             std::vector<MpegRegisteredCallback> out;
++            static const int audioTrack = [] {
++                const char *value = std::getenv("GOW_MPEG_AUDIO_TRACK");
++                if (!value || !*value) return -1;
++                char *end = nullptr;
++                const long track = std::strtol(value, &end, 10);
++                if (*end || track < 0 || track > 255) return -1;
++                std::fprintf(stderr, "[MPEG:track] forced audio track=%ld (other audio tracks discarded)\n", track);
++                return static_cast<int>(track);
++            }();
++            const bool forcedAudio = audioTrack >= 0 && (streamType == kMpegStrPCM || streamType == kMpegStrADPCM);
++            if (forcedAudio && channel != static_cast<uint32_t>(audioTrack)) return out;
+             auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+             if (it == g_mpeg_stub_state.callbacksByMpeg.end())
+             {
+@@ -1285,7 +1296,7 @@ namespace ps2_stubs
+ 
+             for (const MpegRegisteredCallback &callback : it->second)
+             {
+-                if (callback.stream && callback.type == streamType)
++                if (callback.stream && callback.type == streamType && (forcedAudio || callback.streamId == channel))
+                 {
+                     out.push_back(callback);
+                 }
+@@ -1299,7 +1310,8 @@ namespace ps2_stubs
+                                       uint32_t len,
+                                       std::vector<MpegStreamCallbackEvent> &callbackEvents,
+                                       int64_t pts90k = -1,
+-                                      int64_t dts90k = -1)
++                                      int64_t dts90k = -1,
++                                      uint32_t channel = 0u)
+         {
+             MpegStreamCallbackEvent event{};
+             event.mpegAddr = mpegAddr;
+@@ -1308,7 +1320,7 @@ namespace ps2_stubs
+             event.len = len;
+             event.pts = pts90k >= 0 ? static_cast<uint64_t>(pts90k) : 0xFFFFFFFFFFFFFFFFull;
+             event.dts = dts90k >= 0 ? static_cast<uint64_t>(dts90k) : 0xFFFFFFFFFFFFFFFFull;
+-            event.callbacks = matchingStreamCallbacks(mpegAddr, streamType);
++            event.callbacks = matchingStreamCallbacks(mpegAddr, streamType, channel);
+             if (!event.callbacks.empty())
+             {
+                 callbackEvents.push_back(std::move(event));
+@@ -1480,7 +1492,8 @@ namespace ps2_stubs
+                                 static_cast<uint32_t>(packetEnd - payloadStart),
+                                 callbackEvents,
+                                 pes.pts90k,
+-                                pes.dts90k);
++                                pes.dts90k,
++                                streamId - 0xE0u);
+                         }
+                         feedElementaryStream(
+                             playback,
+@@ -1496,8 +1509,8 @@ namespace ps2_stubs
+                     const size_t payloadStart = pes.payloadOffset;
+                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                     {
+-                        // PSS audio: private stream 1 with a 4-byte sub-stream header (FF A0 00 00; 0xAn = PCM channel
+-                        // n, otherwise ADPCM) that the game's callback skips. The PCM runs on across packets of odd
++                        // PSS audio: private stream 1 with a 4-byte sub-stream header (FF A0 00 channel).
++                        // A0 identifies PCM; the last byte selects the language track. The PCM runs across packets of odd
+                         // lengths (God of War: 4073 / 4059 data bytes).
+                         const uint8_t subStream = payloadStart + 1u < packetEnd ? buffer[payloadStart + 1u] : 0u;
+                         const bool pcm = streamId == kMpegPrivateStream1 && (subStream & 0xF0u) == 0xA0u;
+@@ -1518,7 +1531,9 @@ namespace ps2_stubs
+                             static_cast<uint32_t>(packetEnd - payloadStart),
+                             callbackEvents,
+                             pes.pts90k,
+-                            pes.dts90k);
++                            pes.dts90k,
++                            streamId == kMpegPrivateStream1 && payloadStart + 3u < packetEnd
++                                ? buffer[payloadStart + 3u] : streamId - 0xC0u);
+                         // a packet can straddle two of the game's reads into the same buffer: its guest bytes are
+                         // gone by the time the callback runs, so audio is handed over from this copy
+                         if (callbackEvents.size() != before)
+@@ -2237,21 +2252,8 @@ namespace ps2_stubs
+         }
+     }
+ 
+-    void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    void prepareMpegNativeCreate(uint32_t param_1)
+     {
+-        const uint32_t param_1 = getRegU32(ctx, 4); // a0
+-        const uint32_t param_2 = getRegU32(ctx, 5); // a1
+-        const uint32_t param_3 = getRegU32(ctx, 6); // a2
+-
+-        const uint32_t uVar3 = (param_2 + 3u) & 0xFFFFFFFCu;
+-        const int32_t iVar2_signed = static_cast<int32_t>(param_3) - static_cast<int32_t>(uVar3 - param_2);
+-
+-        if (iVar2_signed <= 0x117)
+-        {
+-            setReturnU32(ctx, 0u);
+-            return;
+-        }
+-
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             // GOW-Port: God of War demultiplexa el primer bloque del PSS (con la cabecera de secuencia)
+@@ -2272,6 +2274,24 @@ namespace ps2_stubs
+             // audio packet twice into its ring (repeated, byte-shifted PCM: the movie sound was noise).
+             g_mpeg_stub_state.callbacksByMpeg.erase(param_1);
+         }
++    }
++
++    void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t param_1 = getRegU32(ctx, 4); // a0
++        const uint32_t param_2 = getRegU32(ctx, 5); // a1
++        const uint32_t param_3 = getRegU32(ctx, 6); // a2
++
++        const uint32_t uVar3 = (param_2 + 3u) & 0xFFFFFFFCu;
++        const int32_t iVar2_signed = static_cast<int32_t>(param_3) - static_cast<int32_t>(uVar3 - param_2);
++
++        if (iVar2_signed <= 0x117)
++        {
++            setReturnU32(ctx, 0u);
++            return;
++        }
++
++        prepareMpegNativeCreate(param_1);
+ 
+         const uint32_t puVar4 = uVar3 + 0x108u;
+         const uint32_t innerSize = static_cast<uint32_t>(iVar2_signed) - 0x118u;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
+index 00bae50..52d0e00 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
+@@ -7,6 +7,7 @@ namespace ps2_stubs
+     void resetMpegStubState();
+     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
+     bool mpegWaitingForSequenceHeaderForTesting(uint32_t mpegAddr); // GOW-Port
++    void prepareMpegNativeCreate(uint32_t mpegAddr);
+     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
+     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
+     void notifyMpegCdStreamEof(PS2Runtime *runtime = nullptr);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+index d6b7549..11d9f04 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -243,20 +243,40 @@ inline std::filesystem::path g_cdrom_cwd;
+ inline std::string g_ps2_cwd_device = "host0";
+ 
+ static constexpr uint32_t kRpcPacketSize = 64;
++// GOW-Port: opt-in game-owned RAM isolation below the ELF.
++#if defined(PS2X_GOW_LOW_RESERVED_MEMORY)
++static constexpr uint32_t kRpcPacketPoolBase = 0x00080000;
++#else
+ static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
++#endif
+ static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
++// GOW-Port: opt-in game-owned RAM isolation below the ELF.
++#if defined(PS2X_GOW_LOW_RESERVED_MEMORY)
++static constexpr uint32_t kRpcServerPoolBase = 0x00090000;
++#else
+ static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
++#endif
+ static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcServerStride = 0x80;
+ static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
+ 
++// GOW-Port: opt-in game-owned RAM isolation below the ELF.
++#if defined(PS2X_GOW_LOW_RESERVED_MEMORY)
++static constexpr uint32_t kTlsPoolBase = 0x000A0000;
++#else
+ static constexpr uint32_t kTlsPoolBase = 0x01F20000;
++#endif
+ static constexpr uint32_t kTlsPoolBytes = 0x00010000;
+ static constexpr uint32_t kTlsBlockSize = 0x100;
+ static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
+ 
++// GOW-Port: opt-in game-owned RAM isolation below the ELF.
++#if defined(PS2X_GOW_LOW_RESERVED_MEMORY)
++static constexpr uint32_t kBootModePoolBase = 0x0007F000;
++#else
+ static constexpr uint32_t kBootModePoolBase = 0x01F30000;
++#endif
+ static constexpr uint32_t kBootModePoolBytes = 0x00001000;
+ 
+ static constexpr uint32_t kSifRpcModeNowait = 0x01;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 22a021f..4f336da 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -548,6 +548,8 @@ namespace ps2_syscalls
+             static const bool frameClockTrace = std::getenv("GOW_FRAMECLOCK_TRACE") != nullptr;
+             if (frameClockTrace)
+             {
++                // GOW-Port: inspect the actual buffers when diagnosing SCAJ completion.
++                std::fprintf(stderr, "[scaj-rpc-buffer] rpc=%x send=%x/%x recv=%x/%x registers=%d\n", rpcNum, sendBuf, sendSize, receiveBuffer, receiveSize, useRegisterConvention);
+                 uint32_t command = 0u;
+                 if (sendBuf != 0u && sendSize >= 8u)
+                     std::memcpy(&command, getMemPtr(rdram, sendBuf + 4u), sizeof(command));
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_dk.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_dk.cpp
+index 89edf3d..3495286 100644
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_dk.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_dk.cpp
+@@ -13,6 +13,7 @@
+ #include "gs_gl.h"
+ #include "gs_dk_shaders.h"
+ #include "runtime/gs/gs_shared_present.h"
++#include "runtime/switch_video_config.h"
+ 
+ #include <deko3d.h>
+ #include <switch.h>
+@@ -49,7 +50,7 @@ namespace
+     constexpr uint32_t kImageSlots = 16384u;         // image descriptors (a ring: a slot comes back after 16384 images)
+     constexpr uint32_t kSamplerSlots = 64u;
+     constexpr uint32_t kSwapImages = 3u;
+-    constexpr uint32_t kScreenW = 1280u, kScreenH = 720u;
++    uint32_t kScreenW = 1280u, kScreenH = 720u;
+ 
+     uint32_t align(uint32_t v, uint32_t a) { return (v + a - 1u) / a * a; }
+ 
+@@ -209,6 +210,7 @@ namespace
+         GLenum depthFunc = 0x0201;
+         float clearColor[4] = {}, clearDepth = 1.f;
+         GLint viewport[4] = {}, scissorBox[4] = {};
++        uint32_t fixedDirty = 31u; // raster/color/write/blend/depth; reset at every command list
+         bool stateDirty = true, rtDirty = true, viewportDirty = true, programDirty = true, blendConstDirty = true;
+         // what the open command list has bound (GOW-Port: re-bound only when it changes; reset at every submit)
+         struct StageBinding
+@@ -243,6 +245,7 @@ namespace
+ 
+         // counters ([gs-dk] every 5 s with GOW_PERF_DIAG)
+         uint64_t draws = 0, submitsCount = 0, waits = 0, waitNanos = 0, uploads = 0, uploadBytes = 0, presents = 0;
++        uint64_t fixedCommands = 0;
+         uint64_t stateBinds = 0, resourceBinds = 0, textureBinds = 0, programBinds = 0, uboPushes = 0, uboPushBytes = 0,
+                  vtxBinds = 0, vtxBufferBinds = 0, rtBinds = 0, barrierCount = 0, drawNanos = 0;
+         uint64_t acquireNanos = 0, presentSubmitNanos = 0, submitNanos = 0;
+@@ -699,34 +702,57 @@ namespace
+             s->blendConstDirty = false;
+             ++s->stateBinds;
+         }
+-        if (!s->stateDirty)
++        if (s->stateDirty)
++            s->fixedDirty = 31u;
++        if (!s->fixedDirty)
+             return;
+         ++s->stateBinds;
+-        DkRasterizerState raster;
+-        dkRasterizerStateDefaults(&raster);
+-        raster.cullMode = DkFace_None;
+-        dkCmdBufBindRasterizerState(s->cmd, &raster);
+-        DkColorState color;
+-        dkColorStateDefaults(&color);
+-        dkColorStateSetBlendEnable(&color, 0, s->blend);
+-        dkCmdBufBindColorState(s->cmd, &color);
+-        DkColorWriteState write;
+-        dkColorWriteStateDefaults(&write);
+-        dkColorWriteStateSetMask(&write, 0, (s->mask[0] ? DkColorMask_R : 0u) | (s->mask[1] ? DkColorMask_G : 0u) |
+-                                                (s->mask[2] ? DkColorMask_B : 0u) | (s->mask[3] ? DkColorMask_A : 0u));
+-        dkCmdBufBindColorWriteState(s->cmd, &write);
+-        DkBlendState blend;
+-        dkBlendStateDefaults(&blend);
+-        dkBlendStateSetOps(&blend, blendOp(s->eqColor), blendOp(s->eqAlpha));
+-        dkBlendStateSetFactors(&blend, blendFactor(s->blendSrc), blendFactor(s->blendDst), blendFactor(s->blendSrcA),
+-                               blendFactor(s->blendDstA));
+-        dkCmdBufBindBlendState(s->cmd, 0, &blend);
+-        DkDepthStencilState depth;
+-        dkDepthStencilStateDefaults(&depth);
+-        depth.depthTestEnable = s->depthTest;
+-        depth.depthWriteEnable = s->depthTest && s->depthWrite; // GL: no depth write without the test
+-        depth.depthCompareOp = compareOp(s->depthFunc);
+-        dkCmdBufBindDepthStencilState(s->cmd, &depth);
++        if (s->fixedDirty & 1u)
++        {
++            ++s->fixedCommands;
++            DkRasterizerState raster;
++            dkRasterizerStateDefaults(&raster);
++            raster.cullMode = DkFace_None;
++            dkCmdBufBindRasterizerState(s->cmd, &raster);
++        }
++        if (s->fixedDirty & 2u)
++        {
++            ++s->fixedCommands;
++            DkColorState color;
++            dkColorStateDefaults(&color);
++            dkColorStateSetBlendEnable(&color, 0, s->blend);
++            dkCmdBufBindColorState(s->cmd, &color);
++        }
++        if (s->fixedDirty & 4u)
++        {
++            ++s->fixedCommands;
++            DkColorWriteState write;
++            dkColorWriteStateDefaults(&write);
++            dkColorWriteStateSetMask(&write, 0, (s->mask[0] ? DkColorMask_R : 0u) | (s->mask[1] ? DkColorMask_G : 0u) |
++                                                    (s->mask[2] ? DkColorMask_B : 0u) | (s->mask[3] ? DkColorMask_A : 0u));
++            dkCmdBufBindColorWriteState(s->cmd, &write);
++        }
++        if (s->fixedDirty & 8u)
++        {
++            ++s->fixedCommands;
++            DkBlendState blend;
++            dkBlendStateDefaults(&blend);
++            dkBlendStateSetOps(&blend, blendOp(s->eqColor), blendOp(s->eqAlpha));
++            dkBlendStateSetFactors(&blend, blendFactor(s->blendSrc), blendFactor(s->blendDst), blendFactor(s->blendSrcA),
++                                   blendFactor(s->blendDstA));
++            dkCmdBufBindBlendState(s->cmd, 0, &blend);
++        }
++        if (s->fixedDirty & 16u)
++        {
++            ++s->fixedCommands;
++            DkDepthStencilState depth;
++            dkDepthStencilStateDefaults(&depth);
++            depth.depthTestEnable = s->depthTest;
++            depth.depthWriteEnable = s->depthTest && s->depthWrite; // GL: no depth write without the test
++            depth.depthCompareOp = compareOp(s->depthFunc);
++            dkCmdBufBindDepthStencilState(s->cmd, &depth);
++        }
++        s->fixedDirty = 0u;
+         s->stateDirty = false;
+     }
+ 
+@@ -878,13 +904,15 @@ namespace
+                      (unsigned long long)s->draws, (unsigned long long)s->submitsCount, (unsigned long long)s->presents,
+                      (unsigned long long)s->waits, s->waitNanos * 1e-6, (unsigned long long)s->uploads,
+                      (unsigned long long)(s->uploadBytes >> 10), s->textures.size() - s->freeTextures.size());
+-        std::fprintf(stderr, "[gs-dk-binds] draw_ms=%.1f state=%llu rt=%llu program=%llu ubo_push=%llu ubo_kb=%llu ubo_bind=%llu tex_bind=%llu vtx_state=%llu vtx_buf=%llu barriers=%llu\n",
++        std::fprintf(stderr, "[gs-dk-binds] draw_ms=%.1f state=%llu rt=%llu program=%llu ubo_push=%llu ubo_kb=%llu ubo_bind=%llu tex_bind=%llu vtx_state=%llu vtx_buf=%llu barriers=%llu fixed_cmd=%llu\n",
+                      s->drawNanos * 1e-6, (unsigned long long)s->stateBinds, (unsigned long long)s->rtBinds,
+                      (unsigned long long)s->programBinds, (unsigned long long)s->uboPushes,
+                      (unsigned long long)(s->uboPushBytes >> 10), (unsigned long long)s->resourceBinds,
+                      (unsigned long long)s->textureBinds, (unsigned long long)s->vtxBinds,
+-                     (unsigned long long)s->vtxBufferBinds, (unsigned long long)s->barrierCount);
++                     (unsigned long long)s->vtxBufferBinds, (unsigned long long)s->barrierCount,
++                     (unsigned long long)s->fixedCommands);
+         s->draws = s->submitsCount = s->presents = s->waits = s->waitNanos = s->uploads = s->uploadBytes = 0;
++        s->fixedCommands = 0;
+         s->stateBinds = s->resourceBinds = s->textureBinds = s->programBinds = s->uboPushes = s->uboPushBytes = 0;
+         std::fprintf(stderr, "[gs-dk-time] acquire_ms=%.1f present_submit_ms=%.1f submit_ms=%.1f buf_new=%llu buf_reused=%llu\n", s->acquireNanos * 1e-6,
+                      s->presentSubmitNanos * 1e-6, s->submitNanos * 1e-6, (unsigned long long)s->poolCreates,
+@@ -1477,8 +1505,8 @@ namespace
+     {
+         switch (cap)
+         {
+-        case kBlend: if (s->blend != on) s->blend = on, s->stateDirty = true; break;
+-        case kDepthTest: if (s->depthTest != on) s->depthTest = on, s->stateDirty = true; break;
++        case kBlend: if (s->blend != on) s->blend = on, s->fixedDirty |= 2u; break;
++        case kDepthTest: if (s->depthTest != on) s->depthTest = on, s->fixedDirty |= 16u; break;
+         case kScissorTest: if (s->scissor != on) s->scissor = on, s->viewportDirty = true; break;
+         case kConservative: dkCmdBufSetConservativeRasterEnable(s->cmd, on); break;
+         default: break;
+@@ -1491,14 +1519,14 @@ namespace
+         if (s->blendSrc == a && s->blendDst == b && s->blendSrcA == c && s->blendDstA == d)
+             return;
+         s->blendSrc = a, s->blendDst = b, s->blendSrcA = c, s->blendDstA = d;
+-        s->stateDirty = true;
++        s->fixedDirty |= 8u;
+     }
+     void dkBlendEquationSeparate(GLenum a, GLenum b)
+     {
+         if (s->eqColor == a && s->eqAlpha == b)
+             return;
+         s->eqColor = a, s->eqAlpha = b;
+-        s->stateDirty = true;
++        s->fixedDirty |= 8u;
+     }
+     void dkBlendColor(float r, float g, float b, float a)
+     {
+@@ -1513,17 +1541,17 @@ namespace
+         if (s->mask[0] == m[0] && s->mask[1] == m[1] && s->mask[2] == m[2] && s->mask[3] == m[3])
+             return;
+         s->mask[0] = m[0], s->mask[1] = m[1], s->mask[2] = m[2], s->mask[3] = m[3];
+-        s->stateDirty = true;
++        s->fixedDirty |= 4u;
+     }
+     void dkDepthMask(GLboolean on)
+     {
+         if (s->depthWrite != (on != 0))
+-            s->depthWrite = on != 0, s->stateDirty = true;
++            s->depthWrite = on != 0, s->fixedDirty |= 16u;
+     }
+     void dkDepthFunc(GLenum f)
+     {
+         if (s->depthFunc != f)
+-            s->depthFunc = f, s->stateDirty = true;
++            s->depthFunc = f, s->fixedDirty |= 16u;
+     }
+     void dkClearColor(float r, float g, float b, float a) { s->clearColor[0] = r, s->clearColor[1] = g, s->clearColor[2] = b, s->clearColor[3] = a; }
+     void dkClearDepth(double d) { s->clearDepth = static_cast<float>(d); }
+@@ -1616,7 +1644,7 @@ namespace
+         std::chrono::steady_clock::time_point start;
+         DrawTimer()
+         {
+-            static const bool timed = [] { const char *v = std::getenv("GOW_PERF_DIAG"); return v && *v && *v != '0'; }();
++            static const bool timed = [] { const char *v = std::getenv("GOW_PERF_DIAG"); return v && std::strcmp(v, "1") == 0; }();
+             on = timed;
+             if (on)
+                 start = std::chrono::steady_clock::now();
+@@ -1717,7 +1745,10 @@ namespace
+         s->swapchain = dkSwapchainCreate(&sm);
+         if (!s->swapchain)
+             return false;
+-        dkSwapchainSetSwapInterval(s->swapchain, 1);
++        const char *interval=std::getenv("GOW_SWAP_INTERVAL");
++        const int swapInterval=interval && std::strcmp(interval,"2")==0 ? 2 : 1;
++        dkSwapchainSetSwapInterval(s->swapchain, swapInterval);
++        std::fprintf(stderr,"[gs-dk] swap interval=%d (nominal output ceiling %d Hz on a 60 Hz display)\n",swapInterval,60/swapInterval);
+         return true;
+     }
+ 
+@@ -2018,6 +2049,10 @@ namespace
+ 
+         const char *flip = std::getenv("GOW_DK_PRESENT_FLIP");
+         s->flipPresent = !(flip && *flip == '0');
++        const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
++        const auto output=ps2_switch_video::outputSize(docked);
++        kScreenW = output.width;
++        kScreenH = output.height;
+         step("swapchain");
+         if (!initSwapchain())
+         {
+diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_hw_backend.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_hw_backend.cpp
+index 6c2c47c..d22bd6b 100644
+--- a/ps2xRuntime/src/lib/gs/gpu/gs_hw_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gpu/gs_hw_backend.cpp
+@@ -664,7 +664,7 @@ void main()
+         g.BindBuffer(kPixelPackBuffer, 0u);
+         readbackCopyNanos += static_cast<uint64_t>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+-        static const bool timed = ps2_perf::countFrames();
++        static const bool timed = ps2_perf::enabled();
+         if (++readbackCopies % 256u == 0u && timed)
+         {
+             std::fprintf(stderr, "[gs-hw] readback map+copy %.2f ms per frame (256 frames)\n", readbackCopyNanos * 1e-6 / 256.0);
+@@ -997,19 +997,21 @@ void main()
+     } cpuTiming;
+     void cpuMark(int part)
+     {
++        if (!ps2_perf::enabled()) return;
+         const auto now = std::chrono::steady_clock::now();
+         cpuTiming.parts[part] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - cpuTiming.mark).count());
+         cpuTiming.mark = now;
+     }
+     static uint64_t nanosSince(std::chrono::steady_clock::time_point start)
+     {
++        if (!ps2_perf::enabled()) return 0u;
+         return static_cast<uint64_t>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+     }
+     uint64_t decodes = 0;
+     void reportCpu()
+     {
+-        static const bool timed = ps2_perf::countFrames();
++        static const bool timed = ps2_perf::enabled();
+         const auto now = std::chrono::steady_clock::now();
+         if (!timed || now - cpuTiming.last < std::chrono::seconds(5))
+             return;
+@@ -1034,7 +1036,7 @@ void main()
+     }
+     GLint streamVertices(StreamBuffer &sb, const void *data, size_t bytes, size_t stride, GLenum target = kArrayBuffer)
+     {
+-        const auto streamStart = std::chrono::steady_clock::now();
++        const auto streamStart = ps2_perf::enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         struct StreamTimer
+         {
+             CpuTiming &t;
+@@ -1300,8 +1302,32 @@ void main()
+         return psm == GS_PSM_T8 || psm == GS_PSM_T8H || psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
+     }
+ 
++    void trimTextureCache()
++    {
++#if defined(PS2X_DK)
++        if (textures.size() < 384u) return;
++        std::vector<std::pair<uint64_t,uint64_t>> oldest;
++        oldest.reserve(textures.size());
++        for(const auto &item : textures) oldest.emplace_back(item.second.lastUse,item.first);
++        std::sort(oldest.begin(),oldest.end());
++        const Api &g=gl();
++        const size_t remove=textures.size()-256u;
++        for(size_t i=0;i<remove;++i) {
++            auto it=textures.find(oldest[i].second);
++            if(it->second.id) g.DeleteTextures(1,&it->second.id);
++            for(auto &earlier : it->second.earlier)
++                if(earlier.id) g.DeleteTextures(1,&earlier.id);
++            textures.erase(it);
++        }
++        // deko3d defers destruction until the submit using an image retires.
++        // Drain only at coarse eviction boundaries, not on every texture upload.
++        g.Finish();
++#endif
++    }
++
+     Texture &textureFor(const GSDrawState &s)
+     {
++        trimTextureCache();
+         const GSTex0Reg &t = s.context.tex0;
+         uint64_t key = t.tbp0 | (static_cast<uint64_t>(t.tbw) << 14) | (static_cast<uint64_t>(t.psm & 63) << 20) |
+                        (static_cast<uint64_t>(s.textureWidth) << 26) | (static_cast<uint64_t>(s.textureHeight) << 38);
+@@ -1432,6 +1458,7 @@ void main()
+     // the CLUT, so palette changes (animated CLUTs, the same image with several palettes) cost nothing.
+     Texture &indexTextureFor(const GSDrawState &s)
+     {
++        trimTextureCache();
+         const GSTex0Reg &t = s.context.tex0;
+         const uint64_t key = (1ull << 63) | t.tbp0 | (static_cast<uint64_t>(t.tbw) << 14) | (static_cast<uint64_t>(t.psm & 63) << 20) |
+                              (static_cast<uint64_t>(s.textureWidth) << 26) | (static_cast<uint64_t>(s.textureHeight) << 38);
+@@ -1526,11 +1553,20 @@ void main()
+         if (it != palettes.end())
+             return it->second;
+         const Api &g = gl();
+-        if (palettes.size() > 4096u)
++        if (palettes.size() >
++#if defined(PS2X_DK)
++            256u
++#else
++            4096u
++#endif
++        )
+         {
+             for (auto &kv : palettes)
+                 g.DeleteTextures(1, &kv.second);
+             palettes.clear();
++#if defined(PS2X_DK)
++            g.Finish();
++#endif
+         }
+         uint32_t colors[256];
+         store.BuildPalette(s, colors);
+@@ -2269,11 +2305,22 @@ void main()
+             const float us[2] = {u0, u1}, vs[2] = {v0, v1};
+             // the texel coordinates of the first and last pixel the GS covers (pixel n is covered when lo <= n < hi);
+             // a sprite covering no pixel on the GS keeps its whole range
+-            const auto sampled = [](float p0, float p1, float t0, float t1, float &lo, float &hi)
++            const auto sampled = [this](float p0, float p1, float t0, float t1, float &lo, float &hi)
+             {
++                // Diagnostic A/B: distinguish sprite sample clamping seams
++                // from geometry/scissor cracks. Default preserves normal bounds.
++                static const bool clampSamples = [] {
++                    const char *v = std::getenv("GOW_SPRITE_SAMPLE_CLAMP");
++                    return !v || v[0] != '0';
++                }();
++                if (!clampSamples) { lo = -1e30f; hi = 1e30f; return; }
+                 lo = std::min(t0, t1);
+                 hi = std::max(t0, t1);
+-                const float first = std::ceil(std::min(p0, p1)), last = std::ceil(std::max(p0, p1)) - 1.0f;
++                // Vertex centre correction maps host pixel h to GS coordinate
++                // h/scale. Clamp to those actual covered samples, not the
++                // coarser integer GS samples (which repeat a column at strip seams).
++                const float first = std::ceil(std::min(p0, p1) * scale) / scale;
++                const float last = (std::ceil(std::max(p0, p1) * scale) - 1.0f) / scale;
+                 if (last < first || p1 == p0)
+                     return;
+                 const float ta = t0 + (first - p0) * (t1 - t0) / (p1 - p0), tb = t0 + (last - p0) * (t1 - t0) / (p1 - p0);
+@@ -2478,7 +2525,7 @@ void main()
+             pendingIdx.clear();
+             return;
+         }
+-        const auto drawStart = std::chrono::steady_clock::now();
++        const auto drawStart = ps2_perf::enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         cpuTiming.vertices += pending.size();
+         ++cpuTiming.draws;
+         draw(pendingState, pending, pendingIdx);
+@@ -2855,7 +2902,7 @@ void main()
+         const GLsizei batchCount = static_cast<GLsizei>(indexed ? idx.size() : verts.size());
+         const Api &g = gl();
+         ++frameBatch;
+-        cpuTiming.mark = std::chrono::steady_clock::now();
++        if (ps2_perf::enabled()) cpuTiming.mark = std::chrono::steady_clock::now();
+         struct PostMark
+         {
+             Impl &d;
+@@ -2933,7 +2980,8 @@ void main()
+         const int sx0 = c.scissor.x0, sy0 = c.scissor.y0;
+         const int sw = std::max(0, static_cast<int>(c.scissor.x1) - sx0 + 1), sh = std::max(0, static_cast<int>(c.scissor.y1) - sy0 + 1);
+         g.Scissor(static_cast<GLint>(std::floor(sx0 * scale)), static_cast<GLint>(std::floor(sy0 * scale)),
+-                  static_cast<GLsizei>(std::ceil(sw * scale)), static_cast<GLsizei>(std::ceil(sh * scale)));
++                  sw ? static_cast<GLsizei>(std::ceil((sx0 + sw) * scale) - std::floor(sx0 * scale)) : 0,
++                  sh ? static_cast<GLsizei>(std::ceil((sy0 + sh) * scale) - std::floor(sy0 * scale)) : 0);
+         g.Disable(kCullFace);
+ 
+         // depth
+@@ -3191,7 +3239,7 @@ void main()
+             else
+                 g.DrawArrays(kTriangles, first, batchCount);
+         };
+-        cpuTiming.mark = std::chrono::steady_clock::now(); // the upload itself is stream_ms
++        if (ps2_perf::enabled()) cpuTiming.mark = std::chrono::steady_clock::now(); // the upload itself is stream_ms
+ 
+         const bool ate = (c.test & 1u) != 0u;
+         const uint32_t atst = static_cast<uint32_t>((c.test >> 1) & 7u), aref = static_cast<uint32_t>((c.test >> 4) & 0xFFu);
+@@ -3535,7 +3583,7 @@ void GSHwBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+     static const bool keepBatch = [] { const char *v = std::getenv("GOW_GS_HW_CLUT_KEEP"); return !v || v[0] != '0'; }();
+     if (keepBatch && d.initialized && d.havePending && !d.haveShuffle && !d.clutSourceMayBeTarget(tex0))
+     {
+-        const auto clutStart = std::chrono::steady_clock::now();
++        const auto clutStart = ps2_perf::enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         const std::array<uint16_t, 512> before = d.store.Clut();
+         d.store.LoadClut(tex0, texclut);
+         if (d.store.Clut() == before)
+@@ -3557,7 +3605,7 @@ void GSHwBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+     }
+     d.flushPending();
+     // the CLUT load itself (the draws flushed above are draw_ms)
+-    const auto clutStart = std::chrono::steady_clock::now();
++    const auto clutStart = ps2_perf::enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     struct ClutTimer
+     {
+         Impl &d;
+@@ -3654,8 +3702,8 @@ bool GSHwBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+     g.Enable(kScissorTest);
+     const int sx0 = context.scissor.x0, sy0 = context.scissor.y0;
+     g.Scissor(static_cast<GLint>(std::floor(sx0 * d.scale)), static_cast<GLint>(std::floor(sy0 * d.scale)),
+-              static_cast<GLsizei>(std::ceil((context.scissor.x1 - sx0 + 1) * d.scale)),
+-              static_cast<GLsizei>(std::ceil((context.scissor.y1 - sy0 + 1) * d.scale)));
++              static_cast<GLsizei>(std::ceil((context.scissor.x1 + 1) * d.scale) - std::floor(sx0 * d.scale)),
++              static_cast<GLsizei>(std::ceil((context.scissor.y1 + 1) * d.scale) - std::floor(sy0 * d.scale)));
+     g.ColorMask(kTrue, kTrue, kTrue, kTrue);
+     g.ClearColor((rgba & 0xFF) / 255.0f, ((rgba >> 8) & 0xFF) / 255.0f, ((rgba >> 16) & 0xFF) / 255.0f, ((rgba >> 24) & 0xFF) / 255.0f);
+     g.Clear(kColorBufferBit);
+@@ -3695,7 +3743,7 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
+     PresentationFrame frame;
+     if (!d.ensure())
+         return frame;
+-    static const bool timed = ps2_perf::countFrames();
++    static const bool timed = ps2_perf::enabled();
+     const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     d.flushPending();
+     struct PresentTimer
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 84968f1..163b24a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -2300,7 +2300,7 @@ void GS::flushRun()
+ {
+     if (!m_kicks.empty())
+     {
+-        static const bool kickTimed = ps2_perf::countFrames();
++        static const bool kickTimed = ps2_perf::enabled();
+         const auto start = kickTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         m_backend->SubmitKicks(m_runState, m_runSerial, m_kicks.data(), static_cast<uint32_t>(m_kicks.size()));
+         if (kickTimed)
+@@ -2315,7 +2315,7 @@ void GS::flushRun()
+     }
+     if (m_run.empty())
+         return;
+-    static const bool timed = ps2_perf::countFrames();
++    static const bool timed = ps2_perf::enabled();
+     if (!timed)
+     {
+         m_backend->SubmitRun(m_runState, m_run.data(), static_cast<uint32_t>(m_run.size()));
+diff --git a/ps2xRuntime/src/lib/gs/gs_host_present.cpp b/ps2xRuntime/src/lib/gs/gs_host_present.cpp
+index 0e00063..6531edb 100644
+--- a/ps2xRuntime/src/lib/gs/gs_host_present.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_host_present.cpp
+@@ -405,7 +405,9 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
+         hasLatched = true;
+     }
+     std::this_thread::sleep_for(std::chrono::milliseconds(2));
+-    selected.presented = false;
++    const uint64_t sequence = GSSharedPresent::LatestSequence();
++    selected.presented = sequence != lastSharedSequence;
++    lastSharedSequence = sequence;
+     return selected;
+ #endif
+ #if defined(__SWITCH__)
+@@ -494,12 +496,18 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
+     // GOW-Port: GOW_HOST_SHOT=<n>: at host frame n write the window's back buffer (what is about to be shown) to
+     // host_shot.png in the working directory, plus the frame / window sizes, to check presentation without a desktop grab.
+     static const long hostShotAt = [] { const char *v = std::getenv("GOW_HOST_SHOT"); return v ? std::atol(v) : -1L; }();
++    // GOW-Port: optional repeated renderer captures for unattended local validation.
++    static const long hostShotEvery = [] { const char *v = std::getenv("GOW_HOST_SHOT_EVERY"); return v ? std::atol(v) : 0L; }();
+     static long hostFrame = 0;
+-    if (hostShotAt >= 0 && hostFrame++ == hostShotAt)
++    const long captureFrame = hostFrame++;
++    if (hostShotAt >= 0 && (captureFrame == hostShotAt ||
++        (hostShotEvery > 0 && captureFrame > hostShotAt && (captureFrame - hostShotAt) % hostShotEvery == 0)))
+     {
+         rlDrawRenderBatchActive();
+         Image screen = LoadImageFromScreen();
+-        ExportImage(screen, "host_shot.png");
++        char captureName[96] = "host_shot.png";
++        if (hostShotEvery > 0) std::snprintf(captureName, sizeof(captureName), "host_shot_%ld.png", captureFrame);
++        ExportImage(screen, captureName);
+         UnloadImage(screen);
+         std::fprintf(stderr, "[gs-present] host_shot frame=%ux%u tex=%u window=%dx%d shared=%d scaler=%d\n", selected.width, selected.height,
+                      selected.texture.id, GetScreenWidth(), GetScreenHeight(), selected.shared ? 1 : 0, scaler ? 1 : 0);
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index d6a5305..e44b29d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -275,7 +275,7 @@ void GSThreadedBackend::WorkerLoop()
+             m_pending.pop_front();
+         }
+         {
+-            static const bool timed = ps2_perf::countFrames();
++            static const bool timed = ps2_perf::enabled();
+             const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+             std::lock_guard<std::mutex> exec(m_execMutex);
+ #if defined(__SWITCH__)
+@@ -312,7 +312,7 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
+         const uint32_t length = readAt<uint32_t>(data + offset + 1u);
+         const uint8_t *payload = data + offset + 5u;
+         offset += 5u + length;
+-        static const bool timed = ps2_perf::countFrames();
++        static const bool timed = ps2_perf::enabled();
+         struct OpTimer
+         {
+             bool on;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1907bab..9513ea6 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -12,6 +12,7 @@ static bool gowUsePcsx2Vu1(); // GOW_VU1_PCSX2=1, defined before PS2Runtime::ini
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ee_scheduler.h"
+ #include "ThreadNaming.h"
++#include "runtime/switch_video_config.h"
+ #include "Kernel/Stubs/Audio.h"
+ #include "Kernel/Stubs/GS.h"
+ #include "Kernel/Stubs/MPEG.h"
+@@ -52,7 +53,7 @@ std::atomic<uint64_t> g_gowAudioFramesProduced{0};
+ #if defined(PLATFORM_SWITCH)
+ #include <SDL.h>
+ #endif
+-#if defined(PS2X_DK)
++#if defined(PLATFORM_SWITCH)
+ #include <switch.h> // appletMainLoop: no raylib window to ask whether to close
+ #endif
+ #if !defined(PLATFORM_VITA)
+@@ -76,6 +77,13 @@ namespace
+ 
+     void spu2AudioCallback(void *buffer, unsigned int frames)
+     {
++#if defined(PLATFORM_SWITCH)
++        static const bool named = [] {
++            ThreadNaming::SetCurrentThreadName("AudioOut");
++            return true;
++        }();
++        (void)named;
++#endif
+         int16_t *out = static_cast<int16_t *>(buffer);
+         size_t produced = 0u;
+         if (ps2x::iop::IopSubsystem *source = g_spu2AudioSource.load(std::memory_order_acquire))
+@@ -94,6 +102,22 @@ namespace
+             std::fwrite(out, sizeof(int16_t) * 2u, produced, pcm);
+             std::fflush(pcm);
+         }
++        // Smooth only the transitions into/out of an underrun. This avoids a
++        // discontinuous jump to silence, without replaying old audio or changing its clock.
++        static bool afterUnderflow = true;
++        const size_t fade = std::min<size_t>(produced, 64u);
++        if (afterUnderflow && fade)
++            for (size_t i = 0; i < fade; ++i)
++                for (size_t side = 0; side < 2u; ++side)
++                    out[i * 2u + side] = static_cast<int16_t>(static_cast<int32_t>(out[i * 2u + side]) *
++                        static_cast<int32_t>(i) / static_cast<int32_t>(fade));
++        if (produced < frames && fade)
++            for (size_t i = 0; i < fade; ++i)
++                for (size_t side = 0; side < 2u; ++side)
++                    out[(produced - fade + i) * 2u + side] = static_cast<int16_t>(
++                        static_cast<int32_t>(out[(produced - fade + i) * 2u + side]) *
++                        static_cast<int32_t>(fade - i - 1u) / static_cast<int32_t>(fade));
++        afterUnderflow = produced < frames;
+         std::fill(out + produced * 2u, out + static_cast<size_t>(frames) * 2u, int16_t{0}); // sin datos: silencio
+     }
+ 
+@@ -114,6 +138,12 @@ namespace
+         wanted.format = AUDIO_S16SYS;
+         wanted.channels = 2;
+         wanted.samples = 1024;
++        if (const char *value = std::getenv("GOW_AUDIO_BUFFER_FRAMES"))
++        {
++            const int requested = std::atoi(value);
++            if (requested == 512 || requested == 1024 || requested == 2048 || requested == 4096)
++                wanted.samples = static_cast<Uint16>(requested);
++        }
+         wanted.callback = [](void *, Uint8 *stream, int bytes) { spu2AudioCallback(stream, static_cast<unsigned int>(bytes / 4)); };
+         SDL_AudioSpec obtained{};
+         g_spu2SdlDevice = SDL_OpenAudioDevice(nullptr, 0, &wanted, &obtained, 0);
+@@ -975,14 +1005,16 @@ bool PS2Runtime::initialize(const char *title)
+         (void)title;
+         std::fprintf(stderr, "[run] deko3d build: no raylib window\n");
+ #else
+-        InitWindow(1280, 720, title);
++        const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
++        const auto output=ps2_switch_video::outputSize(docked);
++        InitWindow(static_cast<int>(output.width),static_cast<int>(output.height),title);
+ #endif
+ #else
+         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+-        // GOW-Port: window size. GOW_WINDOW=<w>x<h>; default 1920x1080. The image is always fitted at 16:9
++        // GOW-Port: window size. GOW_WINDOW=<w>x<h>; default 1280x720. The image is always fitted at 16:9
+         // (gs_host_present.cpp); the window stays resizable and is shrunk to the monitor when it does not fit.
+         {
+-            int width = 1920, height = 1080;
++            int width = 1280, height = 720;
+             if (const char *size = std::getenv("GOW_WINDOW"))
+             {
+                 int w = 0, h = 0;
+@@ -1279,8 +1311,14 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+     {
+         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++#if defined(PS2X_GOW_LOW_RESERVED_MEMORY)
++        // GOW-Port: the game heap owns the high RAM normally used for invocation stacks.
++        m_asyncCallbackStackFloor = 0x000B0000u;
++        m_asyncCallbackStackTop = 0x000D0000u;
++#else
+         m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+         m_asyncCallbackStackTop = PS2_RAM_SIZE;
++#endif
+     }
+ 
+     LoadedModule module;
+@@ -1687,6 +1725,15 @@ void gowDumpBranchRing(const char *why)
+ // GOW-Port: GOW_EE_SAMPLE=<hz>: guest-function sampling profile of the EE thread (exclusive: the innermost guest function
+ // entered through dispatchGuestBranch, plus the thread's perf bucket). Printed every 5 s as [ee-prof].
+ std::atomic<uint32_t> g_gowCurFn{0};
++static bool gowEeSamplingEnabled() {
++    static const bool enabled=[] {const char *v=std::getenv("GOW_EE_SAMPLE");return v && std::atoi(v)>0;}();
++    return enabled;
++}
++static bool gowBranchTracingEnabled() {
++    static const bool enabled=[] {const char *v=std::getenv("GOW_BRANCH_TRACE");return v && v[0]=='1';}();
++    return enabled;
++}
++
+ extern std::atomic<uint64_t> g_gowWaitNs[8], g_gowWaitCnt[8];
+ #ifdef __SWITCH__
+ extern "C" void ps2xSwitchSleepNs(long long ns);
+@@ -1745,7 +1792,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      const char *debugName)
+ {
+     // Guest code runs on the EE executor thread only: a relaxed load/store pair instead of a locked fetch_add.
+-    { const uint32_t pos = g_gowRingPos.load(std::memory_order_relaxed); g_gowRingPos.store(pos + 1u, std::memory_order_relaxed);
++    if (gowBranchTracingEnabled()) { const uint32_t pos = g_gowRingPos.load(std::memory_order_relaxed); g_gowRingPos.store(pos + 1u, std::memory_order_relaxed);
+       g_gowRing[pos & 255u] = {sourcePc, targetPc, ctx ? (uint32_t)_mm_cvtsi128_si32(ctx->r[31]) : 0u, (uint32_t)kind}; }
+ 
+     ctx->pc = targetPc;
+@@ -1817,10 +1864,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     };
+     if (traced)
+         traceEvent("enter");
+-    const uint32_t gowPrevFn = g_gowCurFn.load(std::memory_order_relaxed);
+-    g_gowCurFn.store(targetPc, std::memory_order_relaxed);
++    const bool sampleEe=gowEeSamplingEnabled();
++    const uint32_t gowPrevFn = sampleEe ? g_gowCurFn.load(std::memory_order_relaxed) : 0u;
++    if(sampleEe) g_gowCurFn.store(targetPc, std::memory_order_relaxed);
+     targetFn(rdram, ctx, this);
+-    g_gowCurFn.store(gowPrevFn, std::memory_order_relaxed);
++    if(sampleEe) g_gowCurFn.store(gowPrevFn, std::memory_order_relaxed);
+     if (traced)
+         traceEvent("leave");
+ 
+@@ -2839,7 +2887,7 @@ void PS2Runtime::run()
+     std::thread gameThread([&]()
+                            {
+         ThreadNaming::SetCurrentThreadName("GameThread");
+-        if (const char *hz = std::getenv("GOW_EE_SAMPLE"); hz && hz[0])
++        if (const char *hz = std::getenv("GOW_EE_SAMPLE"); hz && std::atoi(hz) > 0)
+         {
+             g_gowEeBucketPtr = reinterpret_cast<const ps2_perf::Bucket *>(&ps2_perf::accounting.active);
+             new std::thread(gowEeSamplerThread, (unsigned)std::atoi(hz)); // leaked: pthread_detach is ENOSYS on the Switch libc
+@@ -2921,6 +2969,14 @@ void PS2Runtime::run()
+             }
+         });
+         // GOW-Port: el helper real termina el batch antes del próximo Acquire.
++#if defined(PLATFORM_SWITCH) && !defined(PS2X_DK)
++        // Poll on the presentation thread; SDL applies a resize on dock/undock.
++        const bool dockedOutput = appletGetOperationMode() == AppletOperationMode_Console;
++        const auto output=ps2_switch_video::outputSize(dockedOutput);
++        const int outputW = static_cast<int>(output.width), outputH = static_cast<int>(output.height);
++        if (GetScreenWidth() != outputW || GetScreenHeight() != outputH)
++            SetWindowSize(outputW, outputH);
++#endif
+         const bool presented = m_hostPresentation->renderFrame(m_gs, m_eeScheduler->currentVSyncTick(), [this]
+         {
+             if (m_debugUiInitialized && m_debugUiDrawCallback)
+diff --git a/ps2xRuntime/src/lib/ps2_switch_runtime.cpp b/ps2xRuntime/src/lib/ps2_switch_runtime.cpp
+index 8f58a86..3d7be13 100644
+--- a/ps2xRuntime/src/lib/ps2_switch_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_switch_runtime.cpp
+@@ -53,14 +53,50 @@ extern "C"
+     // GOW_EE_SAMPLE sampler: std::this_thread::sleep_for throws ENOSYS on this libc
+     void ps2xSwitchSleepNs(long long ns) { svcSleepThread(ns); }
+ 
+-    // ThreadNaming.h: pin the calling thread to one application core (0-2)
+-    void ps2xSwitchPinCurrentThread(int core, int priorityBoost)
++    static Result applyThreadPriorityBoost(int boost)
+     {
+-        const Result rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
++        if (boost == 0) return 0;
+         s32 priority = 0;
+-        Result prc = 0;
+-        if (priorityBoost != 0 && R_SUCCEEDED(svcGetThreadPriority(&priority, CUR_THREAD_HANDLE)))
+-            prc = svcSetThreadPriority(CUR_THREAD_HANDLE, static_cast<u32>(priority - priorityBoost));
++        const Result rc = svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
++        if (R_FAILED(rc)) return rc;
++        return svcSetThreadPriority(CUR_THREAD_HANDLE, static_cast<u32>(priority - boost));
++    }
++
++    // Affinity and priority are independent: automatic migration must preserve
++    // the priorities of producers and time-sensitive consumers.
++    void ps2xSwitchPinCurrentThread(int core, int priorityBoost)
++    {
++        const char *affinity = std::getenv("GOW_CPU_AFFINITY");
++        if (affinity && std::strcmp(affinity, "auto") == 0)
++        {
++            u64 allowed = 0;
++            Result rc = svcGetInfo(&allowed, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
++            if (R_SUCCEEDED(rc) && allowed && !(allowed & ~u64{0xf}))
++            {
++                if (!(allowed & (u64{1} << core)))
++                    for (core = 0; core < 4 && !(allowed & (u64{1} << core)); ++core) {}
++                rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, static_cast<u32>(allowed));
++                std::fprintf(stderr, "[switch] scheduler affinity mask=%#llx preferred=%d rc=%#x\n",
++                             static_cast<unsigned long long>(allowed), core, rc);
++                if (R_SUCCEEDED(rc))
++                {
++                    const Result prc = applyThreadPriorityBoost(priorityBoost);
++                    std::fprintf(stderr, "[switch] automatic affinity priority boost=%d rc=%#x\n", priorityBoost, prc);
++                    return;
++                }
++            }
++            std::fprintf(stderr, "[switch] automatic affinity unavailable rc=%#x; using safe pinning\n", rc);
++        }
++        Result rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
++        // NRO hosts commonly allow only cores 0-2. Do not leave a failed
++        // core-3 request on its inherited core with a boosted priority.
++        if (R_FAILED(rc) && core == 3)
++        {
++            std::fprintf(stderr, "[switch] core 3 unavailable (rc=%#x); retrying core 1\n", rc);
++            core = 1;
++            rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
++        }
++        const Result prc = R_SUCCEEDED(rc) ? applyThreadPriorityBoost(priorityBoost) : rc;
+         std::fprintf(stderr, "[switch] thread pinned to core %d%s, priority boost %d%s\n", core,
+                      R_SUCCEEDED(rc) ? "" : " (failed)", priorityBoost, R_SUCCEEDED(prc) ? "" : " (failed)");
+     }
+@@ -617,17 +653,25 @@ extern "C"
+         setenv("PS2X_GS_WORKER", "1", 0);
+         setenv("GOW_GS_FINISH_ASINCRONO", "1", 0);
+         setenv("GOW_MC0", "sdmc:/switch/gow/play.mcd", 0);
++        const bool renderDocked=appletGetOperationMode()==AppletOperationMode_Console;
++        const char *renderScaleDefault=renderDocked ? "1.607142857" : "1.205357143";
++        const char *scaleKey=renderDocked ? "GOW_RENDER_SCALE_DOCKED" : "GOW_RENDER_SCALE_HANDHELD";
++        if(const char *custom=std::getenv(scaleKey)) {
++            char *end=nullptr; const float value=std::strtof(custom,&end);
++            if(end!=custom && *end=='\0' && value>=1.0f && value<=4.0f) renderScaleDefault=custom;
++            else std::fprintf(stderr,"[switch] invalid %s=%s; use scale 1..4; default retained\n",scaleKey,custom);
++        }
+ #if defined(PS2X_DK)
+         // deko3d renderer (docs/switch-deko3d.md): the PS2's own 640x448 render targets, upscaled to the 720p screen on the
+         // GPU by the bicubic + sharpen present pass. Console 2026-10-19, gameplay: 1x 19-28 fps, 1.6x (720 lines) 12-15 fps.
+         // env.txt PS2X_GS_HW_SCALE=1.6 renders at 720p, GOW_SCALER=bilinear presents with one tap.
+-        setenv("PS2X_GS_HW_SCALE", "1", 0);
++        setenv("PS2X_GS_HW_SCALE", renderScaleDefault, 0);
+ #else
+         // one bilinear tap to present (the bicubic + sharpen pass costs GPU time the Tegra lacks, and crashes Citron)
+         setenv("GOW_SCALER", "bilinear", 0);
+-        // native PS2 resolution (640x448 targets): the console shows 720p, and the 2x targets (up to 2048x2048) cost the
+-        // Tegra four times the fill and readback for detail the screen cannot show
+-        setenv("PS2X_GS_HW_SCALE", "1", 0);
++        // SCAJ HD profile: about 720 internal lines from a 448-line source.
++        // Output mode is independent; env.txt can override the scale after hardware profiling.
++        setenv("PS2X_GS_HW_SCALE", renderScaleDefault, 0);
+ #endif
+         // the SoundMix thread takes batches of 32 samples: on the A57 the least IOP time left on core 1 of 128/64/32
+         // (docs/sound.md "Mixer thread", console table)
+@@ -652,6 +696,14 @@ extern "C"
+         // GPU diagnostics are opt-in again (env.txt GOW_GS_HW_STATS=1 / GOW_GS_GPU_TIME=1 / GOW_GPU_BISECT=1): the bisect
+         // phases draw wrong pictures on purpose, and a timer query per draw plus glGetError per batch cost the GL thread
+         // time; the [gow-perf]/[gs-gl]/[gs-hw-cpu] lines above say where the time goes without them
++        u64 allowedCores = 0, memoryTotal = 0, memoryUsed = 0;
++        const Result coreRc = svcGetInfo(&allowedCores, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
++        const Result totalRc = svcGetInfo(&memoryTotal, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++        const Result usedRc = svcGetInfo(&memoryUsed, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
++        std::fprintf(stderr, "[switch] resources: cores=%#llx rc=%#x memory_total=%llu rc=%#x memory_used=%llu rc=%#x applet_type=%u\n",
++                     static_cast<unsigned long long>(allowedCores), coreRc,
++                     static_cast<unsigned long long>(memoryTotal), totalRc,
++                     static_cast<unsigned long long>(memoryUsed), usedRc, static_cast<unsigned>(appletGetAppletType()));
+         startClocks();
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index a9f02fb..43b293e 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1978,6 +1978,26 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         std::fprintf(stderr, "[vu1-startmac] ours mac=%x clip=%x (after committing pending: mac=%x clip=%x)\n", m_state.mac & 0xFFFFu,
+                      m_state.clip & 0xFFFFFFu, probe.m_state.mac & 0xFFFFu, probe.m_state.clip & 0xFFFFFFu);
+     }
++    // SCAJ capture also covers the native/generic path, which can bypass compiledProgramFor.
++    static const char *captureNativeDir = std::getenv("GOW_VU1_CAPTURA");
++    if (captureNativeDir && m_unit == Unit::VU1 && memory && vuCode && codeSize == PS2_VU1_CODE_SIZE) {
++        static thread_local uint64_t capturedGeneration = ~uint64_t{0};
++        static thread_local const uint8_t *capturedCode = nullptr;
++        const uint64_t generation = memory->getVU1CodeGeneration();
++        if (capturedGeneration != generation || capturedCode != vuCode) {
++            capturedGeneration = generation;
++            capturedCode = vuCode;
++            char name[64];
++            std::snprintf(name,sizeof(name),"/vu1_%016llx.bin",static_cast<unsigned long long>(hashMicrocode(vuCode,codeSize)));
++            const std::string path = std::string(captureNativeDir) + name;
++            if (!std::filesystem::exists(path)) {
++                if (std::FILE *file = std::fopen(path.c_str(),"wb")) {
++                    std::fwrite(vuCode,1,codeSize,file);
++                    std::fclose(file);
++                }
++            }
++        }
++    }
+     // GOW-Port: GOW_VU1_STATS=1 prints, every 5 s, MSCAL runs, VU1 cycles, interpreted steps and host time in run().
+     static const bool vuStats = std::getenv("GOW_VU1_STATS") != nullptr;
+     const uint64_t statCycle0 = vuStats ? m_cycle : 0u;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_hle.inl b/ps2xRuntime/src/lib/vu/ps2_vu1_hle.inl
+index 1c0a683..518d0b8 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_hle.inl
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_hle.inl
+@@ -1034,7 +1034,18 @@ inline Stats g_stats{};
+ inline Stats &stats() { return g_stats; }
+ // The counters have one writer (the VU1 thread's dispatch; report() drains them on the same thread): a relaxed load and
+ // store, not a read-modify-write (an LDXR/STXR loop per kernel call on the A57, ~1 % of the console's VU1 thread)
+-inline void statAdd(std::atomic<uint64_t> &a, uint64_t v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); }
++inline bool collectKernelStats() {
++    static const bool on=[] {
++        const char *perf=std::getenv("GOW_PERF_DIAG");
++        const char *stats=std::getenv("GOW_VU1_HLE_STATS");
++        const char *time=std::getenv("GOW_VU1_HLE_TIME");
++        return (perf && std::strcmp(perf,"1")==0) || (stats && stats[0]=='1') || (time && time[0]=='1');
++    }();
++    return on;
++}
++inline void statAdd(std::atomic<uint64_t> &a, uint64_t v) {
++    if(collectKernelStats()) a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed);
++}
+ // GOW_VU1_HLE_TIME, read on first use into a plain byte (-1 = not read yet)
+ inline bool timeKernels()
+ {
+@@ -1049,7 +1060,7 @@ inline void report(bool force = false)
+     // called at every runNative exit: no static guard, and the clock is read only every 64th call (one runNative ~10-30 us)
+     static int8_t want = -1;
+     if (want < 0)
+-        want = (std::getenv("GOW_PERF_DIAG") || std::getenv("GOW_VU1_HLE_STATS")) ? 1 : 0;
++        want = collectKernelStats() ? 1 : 0;
+     if (!want && !force)
+         return;
+     static uint32_t callsSinceClock = 0;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_native.inl b/ps2xRuntime/src/lib/vu/ps2_vu1_native.inl
+index 6544d29..e7d36d3 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_native.inl
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_native.inl
+@@ -767,7 +767,8 @@ void VU1NativeAccess::codeChanged(VU1Interpreter::NativeState &ns, const uint8_t
+ {
+     using NS = VU1Interpreter::NativeState;
+     constexpr uint32_t kPairs = sizeof(ns.code) / 8u;
+-    static_assert(kPairs == std::size(ns.slots));
++    // GOW-Port: sizeof is unevaluated, valid for a parameter in C++20.
++    static_assert(kPairs == sizeof(ns.slots) / sizeof(ns.slots[0]));
+     ++ns.codeChanges;
+     ++ns.timingEpoch;
+     struct NsTimer
+diff --git a/ps2xRuntime/src/lib/vu_pcsx2/VUops.cpp b/ps2xRuntime/src/lib/vu_pcsx2/VUops.cpp
+index 6329692..6294bf3 100644
+--- a/ps2xRuntime/src/lib/vu_pcsx2/VUops.cpp
++++ b/ps2xRuntime/src/lib/vu_pcsx2/VUops.cpp
+@@ -1,3 +1,5 @@
++// GOW-Port: declarations for std::getenv and std::strtol.
++#include <cstdlib>
+ // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index dfff033..ca2f3df 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -151,6 +151,10 @@ namespace
+             std::cout << "Using argv boot path" << std::endl;
+             return std::filesystem::path(argv[1]);
+         }
++        if (const char *boot = std::getenv("GOW_BOOT_ELF"); boot && boot[0]) {
++            std::cout << "Using GOW_BOOT_ELF path" << std::endl;
++            return std::filesystem::path(boot);
++        }
+ #if defined(PS2X_DEFAULT_BOOT_ELF)
+         std::cout << "Using default boot file" << std::endl;
+         const std::filesystem::path configuredPath = std::filesystem::path(PS2X_DEFAULT_BOOT_ELF);
+diff --git a/ps2xRuntime/include/runtime/switch_video_config.h b/ps2xRuntime/include/runtime/switch_video_config.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/switch_video_config.h
+@@ -0,0 +1,29 @@
++#pragma once
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
++namespace ps2_switch_video
++{
++    struct Size { uint32_t width, height; };
++
++    inline uint32_t readHeight(const char *key, uint32_t fallback, bool docked)
++    {
++        const char *value=std::getenv(key);
++        if(!value) return fallback;
++        char *end=nullptr;
++        const long height=std::strtol(value,&end,10);
++        if(end!=value && *end=='\0' && (height==540 || height==720 || (docked && height==1080)))
++            return static_cast<uint32_t>(height);
++        std::fprintf(stderr,"[switch-video] invalid %s=%s; using %u\n",key,value,fallback);
++        return fallback;
++    }
++
++    inline Size outputSize(bool docked)
++    {
++        static const uint32_t handheld=readHeight("GOW_OUTPUT_HEIGHT_HANDHELD",540u,false);
++        static const uint32_t console=readHeight("GOW_OUTPUT_HEIGHT_DOCKED",720u,true);
++        const uint32_t height=docked ? console : handheld;
++        return {height*16u/9u,height};
++    }
++}
+diff --git a/ps2xRuntime/src/port/scaj_overrides.cpp b/ps2xRuntime/src/port/scaj_overrides.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/port/scaj_overrides.cpp
+@@ -0,0 +1,226 @@
++// GOW-Port: minimum SCAJ initialization adapted from port/overrides-usa/gow_overrides.cpp.
++// Runtime HLE allocations must not overwrite the game's own allocator structures.
++#include "game_overrides.h"
++#include "runtime/ee_scheduler.h"
++#include "ps2_runtime.h"
++#include <cstdio>
++#include <cstring>
++#include "ps2_runtime_macros.h"
++#include "ps2x/iop/disc_source.h"
++#include <chrono>
++#include <cstdlib>
++void sub_00185E20_0x185e20(uint8_t *, R5900Context *, PS2Runtime *);
++void sub_001262C8_0x1262c8(uint8_t *, R5900Context *, PS2Runtime *);
++void sub_001893E0_0x1893e0(uint8_t *, R5900Context *, PS2Runtime *);
++void sub_0018B0F8_0x18b0f8(uint8_t *, R5900Context *, PS2Runtime *);
++void sub_0018B430_0x18b430(uint8_t *, R5900Context *, PS2Runtime *);
++void sub_001890A8_0x1890a8(uint8_t *, R5900Context *, PS2Runtime *);
++void sub_001836E8_0x1836e8(uint8_t *, R5900Context *, PS2Runtime *);
++void sub_00183590_0x183590(uint8_t *, R5900Context *, PS2Runtime *);
++void sub_001B81B8_0x1b81b8(uint8_t *, R5900Context *, PS2Runtime *);
++namespace ps2_stubs { void prepareMpegNativeCreate(uint32_t); }
++void sub_00270420_0x270420(uint8_t *, R5900Context *, PS2Runtime *);
++void gowDumpBranchRing(const char *why);
++void sub_0017DB78_0x17db78(uint8_t *, R5900Context *, PS2Runtime *);
++namespace {
++// USA 17D778 -> GOWS 17DB78: T0 extension 3020A8, previous
++// T0 2C6388, frame start 29D754 and elapsed ticks 29D750.
++void scajFrameClock(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime) {
++    static const bool enabled = [] {
++        const char *v = std::getenv("GOW_FRAME_AUDIO_CATCHUP");
++        return v && v[0] == '1';
++    }();
++    static uint64_t reads = 0, addedCycles = 0;
++    static auto window = std::chrono::steady_clock::now();
++    if (enabled) {
++        auto word = [ram](uint32_t a) { uint32_t v; std::memcpy(&v, ram + a, 4); return v; };
++        const uint32_t t0 = runtime->memory().eeTimerLoad(0x10000000u) & 0xffffu;
++        const uint32_t extended = word(0x3020A8u) + t0 + (t0 < word(0x2C6388u) ? 0x10000u : 0u);
++        const uint32_t elapsed = extended - word(0x29D754u);
++        constexpr uint32_t capTicks = 36037u; // 3.75 fields, below the game's 4-field clamp
++        if (elapsed < capTicks)
++            addedCycles += runtime->eeScheduler().catchUpFrameClock(uint64_t(capTicks - elapsed) * 512u);
++    }
++    sub_0017DB78_0x17db78(ram, ctx, runtime);
++    ++reads;
++    const auto now = std::chrono::steady_clock::now();
++    if (now - window >= std::chrono::seconds(5)) {
++        std::fprintf(stderr, "[scaj-fclk] enabled=%d reads=%llu added_ms=%.1f\n", enabled,
++            static_cast<unsigned long long>(reads), double(addedCycles) * 1000.0 / EeScheduler::kEeClockHz);
++        reads = addedCycles = 0; window = now;
++    }
++}
++bool scajWideEnabled() {
++    static const bool enabled = [] { const char *v=std::getenv("GOW_WIDESCREEN"); return !v || v[0]!='0'; }();
++    return enabled;
++}
++bool scajProgressiveEnabled() {
++    static const bool enabled = [] { const char *v=std::getenv("GOW_PROGRESSIVE"); return !v || v[0]!='0'; }();
++    return enabled;
++}
++void scajApplyWideDefaults(uint8_t *ram) {
++    if(!scajWideEnabled()) return;
++    const uint32_t one=1u, aspect=0x3FE38E39u;
++    std::memcpy(ram+0x29DF80u,&one,4);
++    for(uint32_t address : {0x32DD30u,0x2FC3E8u,0x2FC3B0u})
++        std::memcpy(ram+address,&aspect,4);
++}
++bool g_scajWideAtFirstCrt=true;
++void scajSelectInitialVideoPreset(uint8_t *ram,R5900Context *ctx,PS2Runtime *runtime) {
++    static bool first=true;
++    if(first) {
++        first=false;
++        // 0x220D10 selects 0x2FC3B8 for ProgressiveScan=1 and
++        // 0x2FC380 otherwise. Reuse that native preset at boot, avoiding
++        // an artificial nested mode switch while the menu is constructing.
++        uint32_t presetMode=0;
++        std::memcpy(&presetMode,ram+0x2FC3B8u+0x20u,4);
++        if(scajProgressiveEnabled() && presetMode==0x50u) {
++            SET_GPR_U32(ctx,4,0x2FC3B8u);
++            const uint32_t one=1u;
++            std::memcpy(ram+0x29DF84u,&one,4);
++            std::fprintf(stderr,"[gow-video] initial native ProgressiveScan preset=0x2fc3b8\n");
++        } else if(scajProgressiveEnabled()) {
++            std::fprintf(stderr,"[gow-video] progressive preset unavailable: mode=%#x; original preset retained\n",presetMode);
++        }
++    }
++    sub_00183590_0x183590(ram,ctx,runtime);
++}
++void scajInitOptionsMenu(uint8_t *ram,R5900Context *ctx,PS2Runtime *runtime) {
++    static bool first=true;
++    if(first) {
++        first=false;
++        scajApplyWideDefaults(ram);
++        if(scajProgressiveEnabled()) {const uint32_t one=1;std::memcpy(ram+0x29DF84u,&one,4);}
++        std::fprintf(stderr,"[gow-video] game-option defaults WideScreen=%d ProgressiveScan=%d\n",scajWideEnabled(),scajProgressiveEnabled());
++    }
++    sub_001B81B8_0x1b81b8(ram,ctx,runtime);
++}
++void scajSetupCrt(uint8_t *ram,R5900Context *ctx,PS2Runtime *runtime) {
++    if(g_scajWideAtFirstCrt) {scajApplyWideDefaults(ram);g_scajWideAtFirstCrt=false;}
++    uint32_t flags=0,mode=0; uint16_t frame=0;
++    std::memcpy(&flags,ram+0x32DD34u,4); std::memcpy(&mode,ram+0x32FBF8u,4);
++    std::memcpy(&frame,ram+0x336ADCu,2);
++    std::fprintf(stderr,"[gow-video] native CRT mode=%#x interlace=%u frame=%u\n",mode,(flags>>1)&1u,frame);
++    sub_001836E8_0x1836e8(ram,ctx,runtime);
++}
++void scajDvdDualInfo(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime) {
++    auto disc = ps2x::iop::DiscSource::openExtracted(runtime->getIoPaths().cdRoot);
++    const uint32_t layer = disc ? disc->layer1Start() : 0u;
++    const uint32_t a = GPR_U32(ctx, 4), b = GPR_U32(ctx, 5);
++    if (!disc || a > PS2_RAM_SIZE - 4 || b > PS2_RAM_SIZE - 4) {
++        SET_GPR_S32(ctx, 2, 0);
++    } else {
++        const uint32_t dual = layer != 0;
++        std::memcpy(ram + a, &dual, 4);
++        std::memcpy(ram + b, &layer, 4);
++        SET_GPR_S32(ctx, 2, 1);
++        std::fprintf(stderr, "[gow-scaj] DVD dual=%u layer1=%u from disc layout\n", dual, layer);
++    }
++    ctx->pc = GPR_U32(ctx, 31);
++}
++void scajLoadStartModuleBuffer(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime) {
++    const uint32_t addr = GPR_U32(ctx, 4), len = GPR_U32(ctx, 5), args = GPR_U32(ctx, 6), result = GPR_U32(ctx, 7);
++    if (len > 65536 || args > PS2_RAM_SIZE - len || result > PS2_RAM_SIZE - 4) {
++        SET_GPR_S32(ctx, 2, -1);
++    } else {
++        const auto loaded = runtime->loadIopModuleBuffer(addr, len ? ram + args : nullptr, len);
++        if (result) std::memcpy(ram + result, &loaded.startResult, 4);
++        SET_GPR_S32(ctx, 2, loaded.handled ? loaded.moduleId : -1);
++        std::fprintf(stderr, "[gow-scaj] LoadStartModuleBuffer IOP=%x id=%d start=%d\n", addr, loaded.moduleId, loaded.startResult);
++    }
++    ctx->pc = GPR_U32(ctx, 31);
++}
++void scajIoStateDiagnostic(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime) {
++    if (std::getenv("GOW_SCAJ_IO_DIAG")) {
++        static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(10);
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last > std::chrono::seconds(5)) {
++            last = now;
++            const auto word = [ram](uint32_t a) { uint32_t v=0; if(a <= PS2_RAM_SIZE-4)std::memcpy(&v,ram+a,4); return v; };
++            const uint32_t object = GPR_U32(ctx,17);
++            std::fprintf(stderr,"[gow-scaj-io] pc=%x object=%x state=%x result=%x queue=%x ack=%x head=%x current=%x\n",ctx->pc,object,word(object),word(object+4),word(0x32d434),word(0x455000),word(0x29faa8),word(0x29fae8));
++            const uint32_t pending=word(0x29faa8), count=word(0x29faac);
++            std::fprintf(stderr,"[gow-scaj-io] pending=%x count=%u first=%x last=%x pause=%x queue-index=%x\n",pending,count,word(pending),count<1024?word(pending+4*(count+1)):0,word(0x29d8f8),word(word(0x32d434)+0xc8));
++            std::fprintf(stderr,"[gow-scaj-io] ack words:");
++            for(uint32_t a=0x455000;a<0x455280;a+=4) { if(word(a)) std::fprintf(stderr," +%x=%x",a-0x455000,word(a)); }
++            std::fprintf(stderr,"\n");
++        }
++    }
++    sub_00185E20_0x185e20(ram,ctx,runtime);
++}
++void scajFilterDiagnostic(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime) {
++    static unsigned reports = 0;
++    if(reports == 0) gowDumpBranchRing("scaj-filter-entry");
++    if (ctx->pc != 0x126528u || reports++ < 12) {
++        std::fprintf(stderr, "[gow-scaj-filter] pc=%x index=%llx count=%llx sp=%x ra=%x a0=%x a1=%x t7=%x\n",
++            ctx->pc, (unsigned long long)GPR_U64(ctx,10), (unsigned long long)GPR_U64(ctx,12),
++            GPR_U32(ctx,29), GPR_U32(ctx,31), GPR_U32(ctx,4), GPR_U32(ctx,5), GPR_U32(ctx,15));
++    }
++    sub_001262C8_0x1262c8(ram,ctx,runtime);
++}
++uint32_t scajWord(uint8_t *ram,uint32_t a) { uint32_t v=0; if(a<=PS2_RAM_SIZE-4) std::memcpy(&v,ram+a,4); return v; }
++void scajNormaliseVideoRing(uint8_t *ram) {
++    const uint32_t movie=scajWord(ram,0x303ab8u);
++    if(movie && movie<PS2_RAM_SIZE-0x100u) {
++        const uint32_t base=scajWord(ram,movie+0xe8),size=scajWord(ram,movie+0xec),write=scajWord(ram,movie+0xf0);
++        if(size && base<=PS2_RAM_SIZE && size<=PS2_RAM_SIZE-base && write==base+size) {
++            std::memcpy(ram+movie+0xf0,&base,4);
++            if(std::getenv("GOW_SCAJ_MOVIE_DIAG")) std::fprintf(stderr,"[scaj-movie] normalized ring end=%x -> base=%x\n",write,base);
++        }
++    }
++}
++void scajMovieVideoWrite(uint8_t *ram,R5900Context *ctx,PS2Runtime *runtime) {
++    scajNormaliseVideoRing(ram); sub_0018B0F8_0x18b0f8(ram,ctx,runtime);
++}
++void scajMovieVideoRead(uint8_t *ram,R5900Context *ctx,PS2Runtime *runtime) {
++    scajNormaliseVideoRing(ram); sub_0018B430_0x18b430(ram,ctx,runtime);
++}
++// Semantic instruction match: USA 0x188B80 -> SCAJ 0x1893E0.
++// Preserve the native stream service while keeping its poll-driven clock at host speed.
++void scajMovieStreamRead(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime) {
++    runtime->eeScheduler().catchUpToHost(EeScheduler::kEeClockHz / 60u);
++    if(std::getenv("GOW_SCAJ_MOVIE_DIAG")) {
++        static auto last=std::chrono::steady_clock::now()-std::chrono::seconds(5);
++        auto now=std::chrono::steady_clock::now();
++        if(now-last>=std::chrono::seconds(5)) {
++            last=now; const uint32_t movie=scajWord(ram,0x303ab8u);
++            std::fprintf(stderr,"[scaj-movie-read] movie=%x pc=%x state=%x pending=%x count=%x stream:",movie,ctx->pc,scajWord(ram,0x29d918),scajWord(ram,0x29faa8),scajWord(ram,0x29faac));
++            for(uint32_t off=0;off<0x30;off+=4) std::fprintf(stderr," +%x=%x",off,scajWord(ram,0x2fc890u+off));
++            std::fprintf(stderr," movie:");for(uint32_t off=0x48;off<0x70;off+=4)std::fprintf(stderr," +%x=%x",off,scajWord(ram,movie+off));
++            std::fprintf(stderr,"\n");
++        }
++    }
++    sub_001890A8_0x1890a8(ram,ctx,runtime);
++}
++void scajMovieStreamService(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime) {
++    runtime->eeScheduler().catchUpToHost(EeScheduler::kEeClockHz / 60u);
++    sub_001893E0_0x1893e0(ram,ctx,runtime);
++}
++void scajMpegCreate(uint8_t *ram,R5900Context *ctx,PS2Runtime *runtime) {
++    ps2_stubs::prepareMpegNativeCreate(GPR_U32(ctx,4));
++    sub_00270420_0x270420(ram,ctx,runtime);
++}
++void applyScajHeapIsolation(PS2Runtime &runtime) {
++    runtime.replaceFunction(0x0017DB78u, scajFrameClock);
++    runtime.replaceFunction(0x00183590u, scajSelectInitialVideoPreset);
++    runtime.replaceFunction(0x001B81B8u, scajInitOptionsMenu);
++    runtime.replaceFunction(0x001836E8u, scajSetupCrt);
++    std::fprintf(stderr,"[gow-video] defaults widescreen=%d progressive=%d\n",scajWideEnabled(),scajProgressiveEnabled());
++    runtime.replaceFunction(0x00270420u, scajMpegCreate);
++    runtime.replaceFunction(0x001893E0u, scajMovieStreamService);
++    runtime.replaceFunction(0x001890A8u, scajMovieStreamRead);
++    runtime.replaceFunction(0x0018B0F8u, scajMovieVideoWrite);
++    runtime.replaceFunction(0x0018B430u, scajMovieVideoRead);
++    if(std::getenv("GOW_SCAJ_FILTER_DIAG")) { runtime.replaceFunction(0x00126528u, scajFilterDiagnostic); runtime.replaceFunction(0x001262C8u, scajFilterDiagnostic); runtime.replaceFunction(0x0012633Cu, scajFilterDiagnostic); runtime.replaceFunction(0x00126310u, scajFilterDiagnostic); runtime.replaceFunction(0x00126368u, scajFilterDiagnostic); runtime.replaceFunction(0x00126428u, scajFilterDiagnostic); runtime.replaceFunction(0x00126478u, scajFilterDiagnostic); }
++    if(std::getenv("GOW_SCAJ_IO_DIAG")) runtime.replaceFunction(0x00185F00u, scajIoStateDiagnostic);
++    runtime.replaceFunction(0x00299DA8u, scajLoadStartModuleBuffer);
++    runtime.replaceFunction(0x0027BC30u, scajDvdDualInfo);
++    // GOW-Port: this SDK entry lies in a preceding delay slot and is absent from generated registration.
++    const bool wakeBound = ps2_game_overrides::bindAddressHandler(runtime, 0x00295A50u, "iWakeupThread");
++    std::fprintf(stderr, "[gow-scaj] iWakeupThread bound=%d\n", wakeBound);
++    runtime.setPrivateGuestHeap(0x000D0000u, 0x000FF000u);
++    std::fprintf(stderr, "[gow-scaj] runtime heap isolated below ELF; no guest wait bypasses enabled\n");
++}
++}
++PS2_REGISTER_GAME_OVERRIDE("God of War (SCAJ-973.99 CHS compatibility)", "GOWS_169.41", 0x00100008u, 0u, applyScajHeapIsolation)
+diff --git a/ps2xRuntime/src/port/scaj_pad2.cpp b/ps2xRuntime/src/port/scaj_pad2.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/port/scaj_pad2.cpp
+@@ -0,0 +1,73 @@
++// GOW-Port: native libpad2 adapter for SCAJ-973.99; SDK entries verified by ELF analysis.
++#include "game_overrides.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++namespace {
++struct Socket { bool open=false; uint32_t port=0; };
++std::array<Socket,2> sockets{};
++void done(R5900Context *ctx,int32_t v){SET_GPR_S32(ctx,2,v);ctx->pc=GPR_U32(ctx,31);}
++uint8_t *buffer(uint8_t *ram,uint32_t a,size_t n){const uint32_t p=a&0x1fffffffu;return a&&p<PS2_RAM_SIZE&&n<=PS2_RAM_SIZE-p?ram+p:nullptr;}
++Socket *socket(R5900Context *ctx){const auto h=GPR_U32(ctx,4);return h<sockets.size()&&sockets[h].open?&sockets[h]:nullptr;}
++void init(uint8_t*,R5900Context *ctx,PS2Runtime*){sockets={};done(ctx,1);}
++void create(uint8_t *ram,R5900Context *ctx,PS2Runtime*){
++ const auto *p=buffer(ram,GPR_U32(ctx,4),12);uint32_t port=0,slot=0;
++ if(p){std::memcpy(&port,p+4,4);std::memcpy(&slot,p+8,4);}
++ if(!p||port>=2||slot||(GPR_U32(ctx,5)&63u)){done(ctx,-1);return;}
++ for(uint32_t i=0;i<sockets.size();++i)if(!sockets[i].open){sockets[i]={true,port};std::fprintf(stderr,"[scaj-pad2] socket=%u port=%u\n",i,port);done(ctx,i);return;}
++ done(ctx,-1);
++}
++void remove(uint8_t*,R5900Context *ctx,PS2Runtime*){auto *s=socket(ctx);if(s)s->open=false;done(ctx,s?1:-1);}
++void state(uint8_t*,R5900Context *ctx,PS2Runtime*){auto *s=socket(ctx);done(ctx,s&&s->port==0?1:0);}
++void profile(uint8_t *ram,R5900Context *ctx,PS2Runtime*){auto *p=buffer(ram,GPR_U32(ctx,5),4);auto *s=socket(ctx);if(!p||!s||s->port){done(ctx,-1);return;}std::memset(p,255,4);done(ctx,4);}
++void read(uint8_t *ram,R5900Context *ctx,PS2Runtime *runtime){
++ auto *p=buffer(ram,GPR_U32(ctx,5),18);auto *s=socket(ctx);uint8_t status[32]{};
++ if(!p||!s||s->port||!runtime->padBackend().readState(0,0,status,sizeof(status))){done(ctx,-1);return;}
++ const auto word=[ram](uint32_t a){uint32_t v=0;if(a<=PS2_RAM_SIZE-4)std::memcpy(&v,ram+a,4);return v;};
++ const uint32_t gameState=word(0x29f860u),pending=word(0x29f874u),player=word(0x29f8ccu),movie=word(0x29d918u);
++ if(std::getenv("GOW_PLAYER_TRACE")) {
++  static auto last=std::chrono::steady_clock::now()-std::chrono::seconds(1);
++  const auto now=std::chrono::steady_clock::now();if(now-last>=std::chrono::seconds(1)){
++   last=now;
++   const uint32_t holder=word(0x29e054u),actor=holder<PS2_RAM_SIZE-4?word(holder):0u;
++   float pos[3]{};if(actor>=0x100000u && actor<PS2_RAM_SIZE-0x90u)std::memcpy(pos,ram+actor+0x80u,sizeof(pos));
++   std::fprintf(stderr,"[scaj-player] state=%u pending=%u player=%x movie=%u actor=%x pos=%.3f,%.3f,%.3f\n",gameState,pending,player,movie,actor,pos[0],pos[1],pos[2]);
++  }
++ }
++ // libpad2 payload starts at the buttons, omitting libpad's status/id bytes.
++ if(const char *test=std::getenv("GOW_PAD_TEST");test&&test[0]=='1'){
++  static auto start=std::chrono::steady_clock::now();double t=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
++  status[2]=status[3]=255;for(unsigned i=4;i<8;++i)status[i]=128;
++  if(t>=5&&t<5.6)status[2]&=~8u;
++  for(double press=12;press<100;press+=8)if(t>=press&&t<press+.6)status[3]&=~32u;
++ }
++ if(std::getenv("GOW_PAD_GAMEPLAY_TEST") && gameState==11u && pending==0u && movie==0u && player>=0x100000u && player<PS2_RAM_SIZE) {
++  static auto start=std::chrono::steady_clock::now();const double t=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
++  if(t>=5 && t<25) {status[6]=(static_cast<unsigned>(t/3)&1)?128:200; if(static_cast<unsigned>(t*4)&1)status[3]&=~128u;}
++ }
++ std::memcpy(p,status+2,18);static unsigned reads=0;if(++reads<=3)std::fprintf(stderr,"[scaj-pad2] read buttons=%02x%02x\n",p[1],p[0]);done(ctx,18);
++}
++void vibProfile(uint8_t *ram,R5900Context *ctx,PS2Runtime*) {
++ auto *p=buffer(ram,GPR_U32(ctx,5),1);auto *s=socket(ctx);if(!p||!s||s->port){done(ctx,0);return;}p[0]=3;done(ctx,1);
++}
++void vibSet(uint8_t *ram,R5900Context *ctx,PS2Runtime *runtime) {
++ auto *s=socket(ctx);const auto pn=GPR_U32(ctx,5),dn=GPR_U32(ctx,7);auto *p=buffer(ram,GPR_U32(ctx,6),pn);auto *d=buffer(ram,GPR_U32(ctx,8),dn);
++ if(!s||s->port||!p||!d||!pn||dn>32){done(ctx,0);return;}
++ unsigned bit=0;const auto take=[&](unsigned width){uint32_t v=0;for(unsigned i=0;i<width&&bit<dn*8;++i,++bit)v|=((d[bit/8]>>(bit%8))&1u)<<i;return v;};
++ const bool small=(p[0]&1u)&&take(1)!=0;const uint32_t large=(p[0]&2u)?take(8):0;runtime->padBackend().setActuators(0,small,static_cast<uint8_t>(large));done(ctx,1);
++}
++void install(PS2Runtime &r){
++ r.replaceFunction(0x27d0c0,vibProfile);r.replaceFunction(0x27d140,vibSet);
++ r.replaceFunction(0x27c918,init);r.replaceFunction(0x27c958,init);
++ r.replaceFunction(0x27c9c0,create);r.replaceFunction(0x27cac8,remove);
++ r.replaceFunction(0x27cb20,read);r.replaceFunction(0x27cbf8,profile);r.replaceFunction(0x27ccc8,state);
++ std::fprintf(stderr,"[scaj-pad2] native input adapter installed\n");
++}
++}
++PS2_REGISTER_GAME_OVERRIDE("God of War (SCAJ-973.99 native pad2)","GOWS_169.41",0x100008u,0u,install)
++
++// GOW-Port: controller and actuator bindings are independent of the game memory layout.
+diff --git a/ps2xRuntime/src/port/scaj_timers.cpp b/ps2xRuntime/src/port/scaj_timers.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/port/scaj_timers.cpp
+@@ -0,0 +1,23 @@
++// GOW-Port: native EE timer services adapted from the upstream USA override,
++// with SCAJ SDK addresses verified by analysis. No game-state or wait-flag writes.
++#include "game_overrides.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include "runtime/ee_scheduler.h"
++#include <cstdio>
++namespace {
++void nativeDelay(uint8_t*,R5900Context *ctx,PS2Runtime *runtime) {
++ ctx->pc=GPR_U32(ctx,31);
++ if((ctx->cop0_status&0x10000u)==0){SET_GPR_S32(ctx,2,static_cast<int32_t>(0x80008008u));return;}
++ const uint64_t usec=GPR_U32(ctx,4);
++ runtime->eeScheduler().delayCurrent(usec*EeScheduler::kEeClockHz/1000000u);
++}
++void nativeTimerInit(uint8_t*,R5900Context *ctx,PS2Runtime*) {SET_GPR_S32(ctx,2,0);ctx->pc=GPR_U32(ctx,31);}
++void install(PS2Runtime &r) {
++ r.replaceFunction(0x00295AF0u,nativeDelay);
++ r.replaceFunction(0x0029A980u,nativeTimerInit);
++ r.replaceFunction(0x0029AAE0u,nativeTimerInit);
++ std::fprintf(stderr,"[scaj-timers] DelayThread uses native scheduler; legacy timer 2 init disabled\n");
++}
++}
++PS2_REGISTER_GAME_OVERRIDE("God of War (SCAJ-973.99 native timers)","GOWS_169.41",0x100008u,0u,install)
