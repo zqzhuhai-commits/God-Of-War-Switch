@@ -1,0 +1,1 @@
+# Alternate resolution configurations`n`nCopy one switch/gow/env.txt over SD:/switch/gow/env.txt.

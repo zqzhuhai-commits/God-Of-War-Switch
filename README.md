@@ -1,4 +1,4 @@
-# 战神 Switch 汉化版运行时移植补丁
+# Switch移植《战神1》静态重编译+四种配音汉化版
 
 面向 Nintendo Switch V1 / Tegra X1 / 原厂4GB内存，当前目标为 Horizon homebrew、ARM64原生C++和deko3d。不是Wine/Box64，也不是已完成的Switchroot L4T发行版。
 

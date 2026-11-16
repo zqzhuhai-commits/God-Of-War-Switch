@@ -481,7 +481,7 @@ index 1b73be2..69926fc 100644
  {
      const uint64_t each = cycles != 0u ? cycles : 1u;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index bac917d..a46290b 100644
+index bac917d..91ec83f 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 @@ -1274,9 +1274,20 @@ namespace ps2_stubs
@@ -614,6 +614,56 @@ index bac917d..a46290b 100644
  
          const uint32_t puVar4 = uVar3 + 0x108u;
          const uint32_t innerSize = static_cast<uint32_t>(iVar2_signed) - 0x118u;
+@@ -2761,6 +2781,7 @@ namespace ps2_stubs
+                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
+                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
+                 haveFrame = true;
++                streamFinished = videoEnded(playback) && playback.decodedFrames.empty();
+                 if (g_mpeg_stub_state.pictureTraceCount < 32u)
+                 {
+                     PS2_IF_AGRESSIVE_LOGS({
+@@ -2794,14 +2815,6 @@ namespace ps2_stubs
+             }
+         }
+ 
+-        // GOW-Port: libmpeg's sceMpegIsEnd (God of War runs the original, 0x26FF70) returns the first word of the
+-        // decoder's work area (mp->sys); the decoder sets it when the stream is over. Without it the .m2 player never
+-        // leaves its playing state after the last picture.
+-        if (streamFinished)
+-            if (uint8_t *base = getMemPtr(rdram, mpegAddr))
+-                if (uint8_t *sys = getMemPtr(rdram, *reinterpret_cast<uint32_t *>(base + 0x40)))
+-                    *reinterpret_cast<uint32_t *>(sys) = 1u;
+-
+         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
+         mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
+         mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
+@@ -2888,6 +2901,26 @@ namespace ps2_stubs
+             writeBlankMpegFrame(rdram, imageAddr, width, height, static_cast<size_t>(entryMbCount) * 1024u);
+         }
+ 
++        // The original sceMpegIsEnd reads mp->sys[0]. Publish after copying
++        // the last picture so a caller polling IsEnd need not request another.
++        if (streamFinished)
++        {
++            if (uint8_t *base = getMemPtr(rdram, mpegAddr))
++            {
++                const uint32_t sysAddress = *reinterpret_cast<uint32_t *>(base + 0x40);
++                if (uint8_t *sys = getMemPtr(rdram, sysAddress))
++                {
++                    auto &endFlag = *reinterpret_cast<uint32_t *>(sys);
++                    if (endFlag == 0u)
++                    {
++                        endFlag = 1u;
++                        std::fprintf(stderr, "[MPEG:end] mpeg=0x%x frame=%u delivered=%d\n",
++                                     mpegAddr, frameCount, haveFrame ? 1 : 0);
++                    }
++                }
++            }
++        }
++
+         setReturnS32(ctx, 0);
+     }
+ 
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
 index 00bae50..52d0e00 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
@@ -685,7 +735,7 @@ index 22a021f..4f336da 100644
                  if (sendBuf != 0u && sendSize >= 8u)
                      std::memcpy(&command, getMemPtr(rdram, sendBuf + 4u), sizeof(command));
 diff --git a/ps2xRuntime/src/lib/gs/gpu/gs_dk.cpp b/ps2xRuntime/src/lib/gs/gpu/gs_dk.cpp
-index 89edf3d..3495286 100644
+index 89edf3d..1a9e07d 100644
 --- a/ps2xRuntime/src/lib/gs/gpu/gs_dk.cpp
 +++ b/ps2xRuntime/src/lib/gs/gpu/gs_dk.cpp
 @@ -13,6 +13,7 @@
@@ -893,7 +943,57 @@ index 89edf3d..3495286 100644
          return true;
      }
  
-@@ -2018,6 +2049,10 @@ namespace
+@@ -1744,14 +1775,37 @@ namespace
+     // the composed frame (texture id, or 0 = blank) onto the next swapchain image, 16:9 over the whole 720p screen
+     void present(GLuint texture, uint32_t width, uint32_t height)
+     {
++        auto queueFailed = [&](const char *stage, int slot) {
++            if (!dkQueueIsInErrorState(s->queue))
++                return false;
++            static bool reported = false;
++            if (!reported) {
++                reported = true;
++                std::fprintf(stderr, "[gs-dk] GPU queue error stage=%s slot=%d texture=%u frame=%ux%u output=%ux%u\n",
++                             stage, slot, texture, width, height, kScreenW, kScreenH);
++                std::fflush(stderr);
++            }
++            return true;
++        };
++        if (queueFailed("before-acquire", -1))
++            return;
+         ensureScaleProgram();
+         bindSets();
+         barriers();
+         // the GPU, not this thread, waits for the image to come back from the display
+-        int slot = 0;
++        int slot = -1;
+         DkFence acquired{};
+         const auto acquireStart = std::chrono::steady_clock::now();
+         dkSwapchainAcquireImage(s->swapchain, &slot, &acquired);
++        if (slot < 0 || slot >= static_cast<int>(kSwapImages))
++        {
++            static unsigned failures = 0;
++            if (++failures <= 4u)
++                std::fprintf(stderr, "[gs-dk] invalid swapchain slot=%d frame=%ux%u output=%ux%u queue_error=%d\n",
++                             slot, width, height, kScreenW, kScreenH, dkQueueIsInErrorState(s->queue));
++            std::fflush(stderr);
++            return;
++        }
+         s->acquireNanos += static_cast<uint64_t>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - acquireStart).count());
+         gpuMark(kCatAcquire);
+@@ -1818,6 +1872,10 @@ namespace
+         dkCmdBufBarrier(s->cmd, DkBarrier_Fragments, 0);
+         const auto submitStart = std::chrono::steady_clock::now();
+         submit();
++        // Allow asynchronous queue validation to publish before the fatal present call.
++        svcSleepThread(1000000);
++        if (queueFailed("after-submit", slot))
++            return;
+         dkQueuePresentImage(s->queue, s->swapchain, slot);
+         s->presentSubmitNanos += static_cast<uint64_t>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submitStart).count());
+@@ -2018,6 +2076,10 @@ namespace
  
          const char *flip = std::getenv("GOW_DK_PRESENT_FLIP");
          s->flipPresent = !(flip && *flip == '0');
@@ -1724,7 +1824,7 @@ diff --git a/ps2xRuntime/src/port/scaj_overrides.cpp b/ps2xRuntime/src/port/scaj
 new file mode 100644
 --- /dev/null
 +++ b/ps2xRuntime/src/port/scaj_overrides.cpp
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,285 @@
 +// GOW-Port: minimum SCAJ initialization adapted from port/overrides-usa/gow_overrides.cpp.
 +// Runtime HLE allocations must not overwrite the game's own allocator structures.
 +#include "game_overrides.h"
@@ -1734,6 +1834,7 @@ new file mode 100644
 +#include <cstring>
 +#include "ps2_runtime_macros.h"
 +#include "ps2x/iop/disc_source.h"
++#include <algorithm>
 +#include <chrono>
 +#include <cstdlib>
 +void sub_00185E20_0x185e20(uint8_t *, R5900Context *, PS2Runtime *);
@@ -1757,16 +1858,68 @@ new file mode 100644
 +        const char *v = std::getenv("GOW_FRAME_AUDIO_CATCHUP");
 +        return v && v[0] == '1';
 +    }();
++    static const bool debtEnabled = enabled && [] {
++        const char *v = std::getenv("GOW_FRAME_CLOCK_DEBT");
++        return v && std::strcmp(v, "1") == 0;
++    }();
++    static const bool creditEnabled = enabled && [] {
++        const char *v = std::getenv("GOW_FRAME_CLOCK_CREDIT");
++        return v && std::strcmp(v, "1") == 0;
++    }();
++    constexpr uint32_t fieldTicks = 9610u;
++    constexpr uint32_t frameLimit = 4u * fieldTicks;
++    constexpr uint32_t maxDebt = 6u * fieldTicks;
++    constexpr uint32_t frameStartAddress = 0x29D754u;
++    constexpr uint32_t maxCredit = 2u * fieldTicks;
++    static uint32_t debt = 0, credit = 0;
++    static uint64_t paidTicks = 0, deductedTicks = 0;
++    static auto previousRead = std::chrono::steady_clock::time_point{};
++    auto word = [ram](uint32_t a) { uint32_t v; std::memcpy(&v, ram + a, 4); return v; };
 +    static uint64_t reads = 0, addedCycles = 0;
 +    static auto window = std::chrono::steady_clock::now();
 +    if (enabled) {
-+        auto word = [ram](uint32_t a) { uint32_t v; std::memcpy(&v, ram + a, 4); return v; };
 +        const uint32_t t0 = runtime->memory().eeTimerLoad(0x10000000u) & 0xffffu;
 +        const uint32_t extended = word(0x3020A8u) + t0 + (t0 < word(0x2C6388u) ? 0x10000u : 0u);
-+        const uint32_t elapsed = extended - word(0x29D754u);
++        const uint32_t elapsed = extended - word(frameStartAddress);
 +        constexpr uint32_t capTicks = 36037u; // 3.75 fields, below the game's 4-field clamp
 +        if (elapsed < capTicks)
 +            addedCycles += runtime->eeScheduler().catchUpFrameClock(uint64_t(capTicks - elapsed) * 512u);
++    }
++    if (debtEnabled || creditEnabled) {
++        const auto now = std::chrono::steady_clock::now();
++        const auto gap = now - previousRead;
++        previousRead = now;
++        const uint32_t start = word(frameStartAddress);
++        const uint32_t t0 = runtime->memory().eeTimerLoad(0x10000000u) & 0xffffu;
++        const uint32_t extended = word(0x3020A8u) + t0 + (t0 < word(0x2C6388u) ? 0x10000u : 0u);
++        const uint32_t elapsed = extended - start;
++        // Skip compensation across pauses and ambiguous T0 wraps.
++        if (gap > std::chrono::milliseconds(110) || elapsed >= 0x10000u) {
++            debt = credit = 0;
++        } else if (creditEnabled && elapsed < fieldTicks) {
++            const uint32_t excess = fieldTicks - elapsed;
++            const uint32_t canceled = std::min(debt, excess);
++            debt -= canceled;
++            credit = std::min(maxCredit, credit + excess - canceled);
++        } else if (debtEnabled && elapsed > frameLimit) {
++            const uint32_t lost = elapsed - frameLimit;
++            const uint32_t canceled = std::min(credit, lost);
++            credit -= canceled;
++            debt = std::min(maxDebt, debt + lost - canceled);
++        } else if (elapsed > fieldTicks && credit > 0) {
++            // Time above the upper clamp would be discarded anyway.
++            const uint32_t deduction = std::min(credit, std::min(elapsed, frameLimit) - fieldTicks);
++            const uint32_t adjustedStart = start + (elapsed - std::min(elapsed, frameLimit)) + deduction;
++            std::memcpy(ram + frameStartAddress, &adjustedStart, sizeof(adjustedStart));
++            credit -= deduction;
++            deductedTicks += deduction;
++        } else if (elapsed < frameLimit && debt > 0) {
++            const uint32_t payment = std::min({debt, fieldTicks / 2u, frameLimit - elapsed});
++            const uint32_t adjustedStart = start - payment;
++            std::memcpy(ram + frameStartAddress, &adjustedStart, sizeof(adjustedStart));
++            debt -= payment;
++            paidTicks += payment;
++        }
 +    }
 +    sub_0017DB78_0x17db78(ram, ctx, runtime);
 +    ++reads;
@@ -1774,7 +1927,13 @@ new file mode 100644
 +    if (now - window >= std::chrono::seconds(5)) {
 +        std::fprintf(stderr, "[scaj-fclk] enabled=%d reads=%llu added_ms=%.1f\n", enabled,
 +            static_cast<unsigned long long>(reads), double(addedCycles) * 1000.0 / EeScheduler::kEeClockHz);
-+        reads = addedCycles = 0; window = now;
++        if (debtEnabled)
++            std::fprintf(stderr, "[scaj-fclk-debt] pending_ticks=%u paid_ticks=%llu\n",
++                debt, static_cast<unsigned long long>(paidTicks));
++        if (creditEnabled)
++            std::fprintf(stderr, "[scaj-fclk-credit] pending_ticks=%u deducted_ticks=%llu\n",
++                credit, static_cast<unsigned long long>(deductedTicks));
++        deductedTicks = paidTicks = reads = addedCycles = 0; window = now;
 +    }
 +}
 +bool scajWideEnabled() {
