@@ -13,5 +13,5 @@
   "same_scene_different_camera_frames": true,
   "interpretation": "Per-pass adjacent-column continuity plus visual captures; not a pixel-identical A/B or Switch hardware validation",
   "switch_build": "PASS",
-  "hardware_test": "Pending"
+  "hardware_test": "User reports vertical seam still present; unresolved"
 }
