@@ -893,7 +893,25 @@ index 89edf3d..3495286 100644
          return true;
      }
  
-@@ -2018,6 +2049,10 @@ namespace
+@@ -1750,7 +1781,16 @@ namespace
+         // the GPU, not this thread, waits for the image to come back from the display
+-        int slot = 0;
++        int slot = -1;
+         DkFence acquired{};
+         const auto acquireStart = std::chrono::steady_clock::now();
+         dkSwapchainAcquireImage(s->swapchain, &slot, &acquired);
++        if (slot < 0 || slot >= static_cast<int>(kSwapImages))
++        {
++            static unsigned failures = 0;
++            if (++failures <= 4u)
++                std::fprintf(stderr, "[gs-dk] invalid swapchain slot=%d frame=%ux%u output=%ux%u queue_error=%d\n",
++                             slot, width, height, kScreenW, kScreenH, dkQueueIsInErrorState(s->queue));
++            std::fflush(stderr);
++            return;
++        }
+         s->acquireNanos += static_cast<uint64_t>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - acquireStart).count());
+@@ -2018,6 +2058,10 @@ namespace
  
          const char *flip = std::getenv("GOW_DK_PRESENT_FLIP");
          s->flipPresent = !(flip && *flip == '0');
